@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop, "feat/**" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: "Build & test (PHP ${{ matrix.php }}, opcache=${{ matrix.opcache }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.2", "8.3", "8.4"]
+        opcache: ["0", "1"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+        env:
+          fail-fast: true
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure --enable-pcov --with-php-config="$(command -v php-config)"
+          make -j"$(nproc)"
+
+      # opcache's JIT overrides the VM dispatch and is mutually exclusive with
+      # any extension that overrides zend_execute_ex() (pcov, xdebug, ...); PHP
+      # prints a startup notice and disables JIT. Turn JIT off explicitly so
+      # that notice does not pollute test/SKIPIF output. Line-coverage behaviour
+      # under opcache (without JIT) is what matters here.
+      - name: Run test suite (line mode, default)
+        env:
+          NO_INTERACTION: "1"
+          REPORT_EXIT_STATUS: "1"
+          TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d opcache.enable_cli=${{ matrix.opcache }} -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
+        run: php run-tests.php tests/
+
+      - name: Run test suite (branch mode)
+        env:
+          NO_INTERACTION: "1"
+          REPORT_EXIT_STATUS: "1"
+          TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d pcov.mode=branch -d opcache.enable_cli=${{ matrix.opcache }} -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
+        run: php run-tests.php tests/
+
+  memcheck:
+    name: "Valgrind memcheck (PHP ${{ matrix.php }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build extension (-g -O0)
+        run: |
+          phpize
+          ./configure --enable-pcov --with-php-config="$(command -v php-config)" CFLAGS="-g -O0"
+          make -j"$(nproc)"
+
+      - name: Run test suite under valgrind (branch mode)
+        env:
+          NO_INTERACTION: "1"
+          USE_ZEND_ALLOC: "0"
+          ZEND_DONT_UNLOAD_MODULES: "1"
+          TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d pcov.mode=branch -q -m --show-mem"
+        run: php run-tests.php tests/
+
+  coverage-reports:
+    name: "Branch & path coverage reports"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: none
+          tools: composer
+
+      - name: Build & install extension
+        run: |
+          phpize
+          ./configure --enable-pcov --with-php-config="$(command -v php-config)"
+          make -j"$(nproc)"
+          echo "PCOV_SO=$(pwd)/modules/pcov.so" >> "$GITHUB_ENV"
+
+      - name: Install fixture dependencies
+        working-directory: ci/report-project
+        run: composer install --no-interaction --no-progress
+
+      - name: Generate branch & path coverage reports (native \pcov\collect)
+        run: |
+          php -d extension="$PCOV_SO" -d pcov.enabled=1 -d pcov.mode=branch \
+              -d pcov.directory="$(pwd)/ci/report-project/src" \
+              ci/generate-reports.php "$(pwd)/ci/report-project" "$(pwd)/build/reports"
+
+      - name: Generate PHPUnit HTML + Cobertura via pcov path coverage
+        working-directory: ci/report-project
+        run: |
+          php -d extension="$PCOV_SO" -d pcov.enabled=1 -d pcov.mode=branch \
+              -d pcov.directory="$(pwd)/src" \
+              vendor/bin/phpunit --path-coverage \
+              --coverage-html ../../build/reports/html \
+              --coverage-cobertura ../../build/reports/cobertura.xml \
+              --coverage-text | tee ../../build/reports/phpunit-coverage.txt
+
+      - name: Publish reports to job summary
+        run: cat build/reports/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: build/reports
+          if-no-files-found: error
+
+  package:
+    name: "PECL package"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    permissions:
+      contents: write   # only this job attaches the PECL tarball to tag releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PHP 8.4 (with pecl)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: none
+          tools: pecl
+
+      - name: Validate and build PECL package
+        run: |
+          pecl package-validate package.xml
+          pecl package package.xml
+          ls -l pcov_enhanced-*.tgz
+
+      - name: Verify the packaged tarball builds and loads as pcov
+        run: |
+          tarball=$(ls pcov_enhanced-*.tgz)
+          tmp=$(mktemp -d)
+          tar -xzf "$tarball" -C "$tmp"
+          src=$(dirname "$(find "$tmp" -name config.m4 | head -n1)")
+          cd "$src"
+          phpize
+          ./configure --enable-pcov --with-php-config="$(command -v php-config)"
+          make -j"$(nproc)"
+          php -d extension="$src/modules/pcov.so" -d pcov.enabled=1 \
+              -r 'exit(phpversion("pcov") ? 0 : 1);'
+          php -d extension="$src/modules/pcov.so" -d pcov.enabled=1 -d pcov.mode=branch \
+              -r 'exit(function_exists("xdebug_get_code_coverage") ? 0 : 1);'
+
+      - name: Upload PECL tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: pecl-package
+          path: pcov_enhanced-*.tgz
+          if-no-files-found: error
+
+      - name: Attach tarball to release
+        if: startsWith(github.ref, 'refs/tags/')
+        # Third-party action pinned to a full commit SHA (supply-chain hardening);
+        # this is the step that runs with contents: write. v2 = 3bb12739.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: pcov_enhanced-*.tgz

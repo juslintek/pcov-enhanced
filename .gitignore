@@ -53,3 +53,12 @@ run-tests.log
 tmp-php.ini
 
 /vendor/
+
+# CI fixture / generated reports
+/ci/report-project/vendor/
+/ci/report-project/composer.lock
+/ci/report-project/.phpunit.cache/
+/build/reports/
+
+# built PECL tarball
+pcov_enhanced-*.tgz
