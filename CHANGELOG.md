@@ -7,6 +7,26 @@ this distribution adds on top of it.
 
 ## [Unreleased]
 
+### Documentation
+- **Coverage-tooling compatibility matrix.** Added
+  `docs/05-tooling-compatibility.md` documenting how each coverage-consuming
+  tool works with this drop-in `pcov`/Xdebug-compat build: PHPUnit +
+  php-code-coverage (line via `PcovDriver`; branch/path via `--path-coverage`
+  through the shim), Infection, Paratest, Codeception, Behat, and the
+  Coveralls/Codecov/Scrutinizer uploaders (driver-agnostic Clover/Cobertura
+  consumers). States driver selection per tool, line + branch/path support,
+  caveats, and the real-Xdebug coexistence rule; cites the `Selector` logic from
+  `docs/01-contract.md` and the validated numbers from `docs/03-results.md`.
+- **Future native-API design.** Added `docs/06-future-native-api.md`, a
+  forward-looking design for the clean route (a): a php-code-coverage `Selector`
+  capability probe (`\pcov\capabilities()` / `pcov\collect_path_coverage`) and a
+  native `PcovBranchDriver` (no Xdebug impersonation, reusing the existing
+  `pcov_branch.c` producer), a leaner native collection API proposal, the
+  infrastructure adoption requirements, and a phased migration plan (ship compat
+  shim now -> land Selector probe upstream -> deprecate shim). The line-mode
+  invariant is kept explicit throughout. Cross-linked both new docs from
+  `README.md` and `docs/04-distribution.md`.
+
 ### Distribution
 - **GitLab CI pipeline.** Added `.gitlab-ci.yml` mirroring the GitHub flow on
   the official `php:8.2`/`8.3`/`8.4` images: `build` -> `test` (both line and

@@ -327,6 +327,26 @@ Two container delivery models are documented under [`k8s/`](../k8s/):
 > [`docker/README.md`](../docker/README.md)). The manifests and Dockerfile are
 > validated structurally (YAML parse, `bake --print`) in this repo's tooling.
 
+## 8. Coverage-tooling compatibility & the native-API roadmap
+
+Distribution is only half the adoption story; the other half is which
+coverage-consuming tools work against this build and where the ecosystem goes
+next. Two companion documents cover that:
+
+- **[`05-tooling-compatibility.md`](05-tooling-compatibility.md)** — a
+  compatibility matrix for PHPUnit/php-code-coverage, Infection, Paratest,
+  Codeception, Behat, and the Coveralls/Codecov/Scrutinizer uploaders: how each
+  selects a driver, whether line and branch/path work, caveats, and the
+  real-Xdebug coexistence rule. Uploaders are driver-agnostic (they consume the
+  Clover/Cobertura XML php-code-coverage emits), so the prebuilt-binary and
+  container routes above deliver working coverage uploads unchanged.
+- **[`06-future-native-api.md`](06-future-native-api.md)** — the forward-looking
+  clean route (a): a php-code-coverage `Selector` capability-probe plus a native
+  `PcovBranchDriver` (no Xdebug impersonation), a leaner native collection API,
+  and the infrastructure adoption requirements (what php-code-coverage, PHPUnit,
+  `setup-php`, and the distro/PIE routes documented above would each need) with a
+  phased migration plan.
+
 ## Coexistence & safety
 
 - **Real Xdebug present:** the xdebug-compat surface does not register and
