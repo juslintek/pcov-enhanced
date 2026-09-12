@@ -1,0 +1,153 @@
+# GitLab CI for pcov-enhanced (alternative pcov build).
+#
+# Mirrors .github/workflows/ci.yml: build the extension on the official
+# php:8.2/8.3/8.4 images, run the .phpt suite in BOTH line and branch mode,
+# build+validate the PECL tarball, and on tag pushes publish a GitLab Release
+# that attaches the tarball and the prebuilt modules/pcov.so.
+#
+# NOTE: the official `php:*` images are pulled from Docker Hub / the GitLab
+# container registry, so every job below requires network access at CI time.
+# This cannot run in a fully offline environment.
+
+stages:
+  - build
+  - test
+  - package
+  - release
+
+# Toolchain deps needed by phpize/configure/make on the Debian-based php images.
+.php_setup: &php_setup
+  before_script:
+    - apt-get update
+    - apt-get install -y $PHPIZE_DEPS git
+  variables:
+    PHPIZE_DEPS: "autoconf gcc make libc-dev pkg-config re2c"
+
+# ---------------------------------------------------------------------------
+# build: compile the extension across the PHP version matrix and cache the
+# built tree (modules/pcov.so) for the test/package stages.
+# ---------------------------------------------------------------------------
+build:
+  stage: build
+  image: php:$PHP_VERSION
+  <<: *php_setup
+  parallel:
+    matrix:
+      - PHP_VERSION: ["8.2", "8.3", "8.4"]
+  script:
+    - phpize
+    - ./configure --enable-pcov --with-php-config="$(command -v php-config)"
+    - make -j"$(nproc)"
+    - php -d extension="$(pwd)/modules/pcov.so" -d pcov.enabled=1 -r 'exit(phpversion("pcov")?0:1);'
+  artifacts:
+    paths:
+      - modules/pcov.so
+      - .libs/
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# test: run the .phpt suite in line mode (default) and branch mode
+# (pcov.mode=branch) against the artifact built in the build stage.
+# TEST_PHP_ARGS mirrors .github/workflows/ci.yml.
+# ---------------------------------------------------------------------------
+test:line:
+  stage: test
+  image: php:$PHP_VERSION
+  <<: *php_setup
+  parallel:
+    matrix:
+      - PHP_VERSION: ["8.2", "8.3", "8.4"]
+  needs:
+    - job: build
+      parallel:
+        matrix:
+          - PHP_VERSION: ["8.2", "8.3", "8.4"]
+      artifacts: true
+  variables:
+    NO_INTERACTION: "1"
+    REPORT_EXIT_STATUS: "1"
+    TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
+  script:
+    - php run-tests.php tests/
+
+test:branch:
+  stage: test
+  image: php:$PHP_VERSION
+  <<: *php_setup
+  parallel:
+    matrix:
+      - PHP_VERSION: ["8.2", "8.3", "8.4"]
+  needs:
+    - job: build
+      parallel:
+        matrix:
+          - PHP_VERSION: ["8.2", "8.3", "8.4"]
+      artifacts: true
+  variables:
+    NO_INTERACTION: "1"
+    REPORT_EXIT_STATUS: "1"
+    TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d pcov.mode=branch -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
+  script:
+    - php run-tests.php tests/
+
+# ---------------------------------------------------------------------------
+# package: validate + build the PECL tarball and verify it builds and loads as
+# the drop-in `pcov` extension. Saves the tarball and a per-PHP-version .so as
+# release-ready artifacts.
+# ---------------------------------------------------------------------------
+package:
+  stage: package
+  image: php:8.4
+  <<: *php_setup
+  needs:
+    - job: test:line
+    - job: test:branch
+  script:
+    - pecl package-validate package.xml
+    - pecl package package.xml
+    - ls -l pcov_enhanced-*.tgz
+    # Verify the packaged tarball builds and loads as pcov.
+    - tarball=$(ls pcov_enhanced-*.tgz)
+    - tmp=$(mktemp -d)
+    - tar -xzf "$tarball" -C "$tmp"
+    - src=$(dirname "$(find "$tmp" -name config.m4 | head -n1)")
+    - (cd "$src" && phpize && ./configure --enable-pcov --with-php-config="$(command -v php-config)" && make -j"$(nproc)")
+    - php -d extension="$src/modules/pcov.so" -d pcov.enabled=1 -r 'exit(phpversion("pcov")?0:1);'
+    - php -d extension="$src/modules/pcov.so" -d pcov.enabled=1 -d pcov.mode=branch -r 'exit(function_exists("xdebug_get_code_coverage")?0:1);'
+    # Name the prebuilt .so to encode PHP version + OS + arch + thread-safety.
+    - PHP_MINOR=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+    - ARCH=$(uname -m)
+    - TS=$(php -r 'echo PHP_ZTS?"zts":"nts";')
+    - cp modules/pcov.so "pcov-pcov-enhanced-php${PHP_MINOR}-linux-${ARCH}-${TS}.so"
+    - sha256sum pcov_enhanced-*.tgz pcov-pcov-enhanced-*.so > SHA256SUMS.txt
+    - cat SHA256SUMS.txt
+  artifacts:
+    paths:
+      - pcov_enhanced-*.tgz
+      - pcov-pcov-enhanced-*.so
+      - SHA256SUMS.txt
+    expire_in: 30 days
+
+# ---------------------------------------------------------------------------
+# release: on tag pushes only, create a GitLab Release attaching the PECL
+# tarball and the prebuilt .so + checksums produced by the package stage.
+# Uses the release-cli via GitLab's `release` keyword.
+# ---------------------------------------------------------------------------
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: package
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Publishing GitLab Release for $CI_COMMIT_TAG"
+  release:
+    tag_name: "$CI_COMMIT_TAG"
+    name: "pcov-enhanced $CI_COMMIT_TAG"
+    description: "Automated release of pcov-enhanced $CI_COMMIT_TAG. Attaches the PECL tarball, prebuilt modules/pcov.so, and SHA256SUMS.txt as job artifacts."
+    assets:
+      links:
+        - name: "SHA256SUMS.txt"
+          url: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/SHA256SUMS.txt"

@@ -8,6 +8,20 @@ this distribution adds on top of it.
 ## [Unreleased]
 
 ### Distribution
+- **GitLab CI pipeline.** Added `.gitlab-ci.yml` mirroring the GitHub flow on
+  the official `php:8.2`/`8.3`/`8.4` images: `build` -> `test` (both line and
+  branch mode) -> `package` (`pecl package-validate`/`pecl package`) ->
+  tag-gated `release` (`rules: if $CI_COMMIT_TAG`) that publishes a GitLab
+  Release via `release-cli`.
+- **Prebuilt-binary release assets.** On tag pushes, CI now attaches a
+  per-PHP-version `modules/pcov.so` named to encode version + PHP version + OS +
+  arch + thread-safety (e.g. `pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so`)
+  plus a `SHA256SUMS.txt`, so consumers (e.g. `setup-php`) can install without a
+  toolchain. GitHub: new `prebuilt-binaries` + `checksums` jobs in
+  `.github/workflows/ci.yml` (reusing the SHA-pinned `softprops/action-gh-release`,
+  `contents: write` scoped to release/packaging jobs only). Documented the full
+  release-automation flow, the manual PECL/Packagist publish commands, and a
+  copy-pasteable `setup-php` consumption recipe in `docs/04-distribution.md`.
 - **PIE support documented.** Added a PIE (PHP Installer for Extensions,
   `php/pie`) install route (`pie install juslintek/pcov-enhanced`) to
   `docs/04-distribution.md` and `INSTALL.md`. PIE reuses the existing

@@ -104,12 +104,174 @@ Notes:
 
 ## 5. Prebuilt binaries via CI (recommended for consumers)
 
-The GitHub Actions workflow already builds the extension across PHP 8.2–8.4. To
-ship binaries, extend it to `actions/upload-artifact` / attach to a GitHub
-Release the built `modules/pcov.so` per PHP version/OS, and (optionally) Windows
-DLLs via the existing AppVeyor pipeline. Consumers can then drop the `.so`/`.dll`
-into their extension dir without a toolchain. `setup-php` users can point at the
-release asset.
+On every tag push, CI builds the extension across PHP 8.2–8.4 and attaches the
+per-PHP-version `modules/pcov.so` to the release as a named asset that encodes
+the extension version, PHP version, OS, architecture and thread-safety, e.g.:
+
+```
+pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so
+pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so.sha256
+```
+
+A combined `SHA256SUMS.txt` covering the PECL tarball and every `.so` is also
+attached so consumers can verify downloads. On GitHub these are produced by the
+`prebuilt-binaries` + `checksums` jobs in `.github/workflows/ci.yml`; on GitLab
+by the `package` + `release` stages in `.gitlab-ci.yml`. Consumers can drop the
+`.so` straight into their extension dir without a toolchain (Windows DLLs can
+additionally be shipped via the AppVeyor pipeline).
+
+> **PHP API version matching.** A prebuilt `.so` only loads into a PHP binary
+> with the same PHP API version (and matching ZTS/NTS + debug flag). Always
+> download the asset whose `phpX.Y` and `nts`/`zts` fields match your runtime.
+
+### `setup-php` consumption recipe (no toolchain)
+
+A downstream job can install this build without compiling by downloading the
+prebuilt `.so` for its PHP version and enabling it. This is faster than the
+PECL/PIE route (which builds from source and needs a compiler).
+
+**GitHub Actions** (uses `shivammathur/setup-php`):
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: php
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none            # do NOT let setup-php install upstream pcov/xdebug
+      - name: Install prebuilt pcov-enhanced
+        env:
+          VERSION: "1.1.0"          # the pcov-enhanced release to consume
+        run: |
+          php_minor="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
+          arch="$(uname -m)"
+          ts="$(php -r 'echo PHP_ZTS ? "zts" : "nts";')"
+          asset="pcov-pcov-enhanced-${VERSION}-php${php_minor}-linux-${arch}-${ts}.so"
+          base="https://github.com/juslintek/pcov-enhanced/releases/download/v${VERSION}"
+          curl -fSL -o pcov.so "${base}/${asset}"
+          curl -fSL -o pcov.so.sha256 "${base}/${asset}.sha256"
+          # Verify the download against the published checksum.
+          echo "$(cut -d' ' -f1 pcov.so.sha256)  pcov.so" | sha256sum -c -
+          ext_dir="$(php -i | sed -n 's/^extension_dir => \([^ ]*\).*/\1/p')"
+          sudo cp pcov.so "${ext_dir}/pcov.so"
+          printf 'extension=pcov.so\npcov.enabled=1\npcov.mode=branch\n' \
+            | sudo tee "$(php --ini | sed -n 's/.*: //p' | head -n1)/../conf.d/99-pcov.ini" >/dev/null
+      - run: php -m | grep -i pcov
+```
+
+**GitLab CI** (official `php:8.3` image):
+
+```yaml
+test:
+  image: php:8.3
+  variables:
+    VERSION: "1.1.0"
+  script:
+    - php_minor="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
+    - arch="$(uname -m)"; ts="$(php -r 'echo PHP_ZTS ? "zts" : "nts";')"
+    - asset="pcov-pcov-enhanced-${VERSION}-php${php_minor}-linux-${arch}-${ts}.so"
+    - base="https://gitlab.com/juslintek/pcov-enhanced/-/releases/v${VERSION}/downloads"
+    - curl -fSL -o pcov.so "${base}/${asset}"
+    - ext_dir="$(php -r 'echo ini_get("extension_dir");')"
+    - cp pcov.so "${ext_dir}/pcov.so"
+    - docker-php-ext-enable pcov || echo "extension=pcov.so" > "$PHP_INI_DIR/conf.d/99-pcov.ini"
+    - php -m | grep -i pcov
+```
+
+Prefer this route when you only need to *use* the extension. Use the PECL
+tarball (section 2) or PIE (section 4) when you need a source build (unmatched
+PHP API version, custom `configure` flags, or an unsupported platform).
+
+## 5a. Release automation & publishing
+
+Cutting a release is a version bump + a tag; CI does the rest. The manual
+networked publish steps (PECL, Packagist) are listed explicitly at the end.
+
+### Step 1 — Bump the version (one commit)
+
+Update the version in all three places and set the PECL release date:
+
+- `package.xml`: the `<version><release>X.Y.Z</release></version>` value **and**
+  `<date>YYYY-MM-DD</date>` (must be *today* in UTC, or `pecl
+  package-validate` warns "Release Date is not today").
+- `composer.json`: no hardcoded version is required (Packagist derives it from
+  the git tag), but update any `support`/changelog references if present.
+- `CHANGELOG.md`: move the `[Unreleased]` entries under a new
+  `## [X.Y.Z] - YYYY-MM-DD` heading.
+- Runtime version sentinel: `phpversion('pcov')` is defined in `php_pcov.h`; if
+  the release changes it, bump it there too.
+
+```sh
+git add package.xml composer.json CHANGELOG.md
+git commit -m "chore(release): pcov-enhanced X.Y.Z"
+```
+
+### Step 2 — Tag and push
+
+```sh
+git tag -a vX.Y.Z -m "pcov-enhanced X.Y.Z"
+git push origin main
+git push origin vX.Y.Z          # the tag is what triggers the release jobs
+```
+
+### Step 3 — CI publishes automatically (no human action)
+
+- **GitHub Actions** (`.github/workflows/ci.yml`): on the `refs/tags/*` push,
+  the `package` job attaches the PECL tarball `pcov_enhanced-X.Y.Z.tgz`, the
+  `prebuilt-binaries` job attaches one `pcov-pcov-enhanced-X.Y.Z-phpM.m-linux-<arch>-<ts>.so`
+  (+ `.sha256`) per PHP version, and the `checksums` job attaches a combined
+  `SHA256SUMS.txt`. `contents: write` is scoped to those release/packaging jobs
+  only; every third-party action is SHA-pinned.
+- **GitLab CI** (`.gitlab-ci.yml`): the `package` stage builds the tarball and a
+  prebuilt `.so`; the tag-gated `release` stage (`rules: if $CI_COMMIT_TAG`)
+  creates a GitLab Release via `release-cli` and links the artifacts.
+
+### Step 4 — MANUAL networked publish steps
+
+These require credentials/network and are **not** automated:
+
+**Packagist** (Composer / PIE distribution) — one-time submission, then
+tag-driven auto-update:
+
+```sh
+# One time only: submit the repository URL (needs a Packagist account).
+#   open https://packagist.org/packages/submit
+#   paste: https://github.com/juslintek/pcov-enhanced
+#
+# After submission, install the GitHub service hook so future tags auto-update:
+#   GitHub repo → Settings → Webhooks → Add webhook
+#     Payload URL:  https://packagist.org/api/github?username=<PACKAGIST_USER>
+#     Content type: application/json
+#     Secret:       <your Packagist API token>
+#
+# Or trigger a one-off update from the CLI:
+curl -XPOST -H 'content-type:application/json' \
+  "https://packagist.org/api/update-package?username=<PACKAGIST_USER>&apiToken=<API_TOKEN>" \
+  -d '{"repository":{"url":"https://github.com/juslintek/pcov-enhanced"}}'
+```
+
+**PECL** (only if publishing through a PECL channel; the official `pcov` name on
+`pecl.php.net` belongs to upstream, so this build ships as `pcov_enhanced`):
+
+```sh
+# Validate and build the exact tarball CI produced (sanity check locally):
+pecl package-validate package.xml
+pecl package package.xml                 # -> pcov_enhanced-X.Y.Z.tgz
+
+# Publish to a PECL channel you control (requires a pecl.php.net / channel
+# account with karma on the package). Log in, then upload the release:
+pear login                               # prompts for pecl.php.net credentials
+pecl release pcov_enhanced-X.Y.Z.tgz     # uploads the tarball to the channel
+# (For a private/self-hosted channel, replace with `pirum add`/your channel's
+# upload command. Distro packagers pick the tarball up from the release assets.)
+```
+
+Consumers who do not use a PECL channel can always install straight from the
+GitHub/GitLab release asset (see section 2).
 
 ## 6. Distro packages (downstream)
 
