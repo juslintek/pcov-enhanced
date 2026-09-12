@@ -116,7 +116,8 @@ pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so.sha256
 A combined `SHA256SUMS.txt` covering the PECL tarball and every `.so` is also
 attached so consumers can verify downloads. On GitHub these are produced by the
 `prebuilt-binaries` + `checksums` jobs in `.github/workflows/ci.yml`; on GitLab
-by the `package` + `release` stages in `.gitlab-ci.yml`.
+by the matrixed `prebuilt` + `checksums` jobs in the `package` stage of
+`.gitlab-ci.yml` (one `.so` per PHP version on both platforms).
 
 > **Which checksum is authoritative?** Both the combined `SHA256SUMS.txt` and
 > the per-`.so` `.sha256` sidecars are generated from the same `sha256sum` run,
@@ -234,14 +235,22 @@ git push origin vX.Y.Z          # the tag is what triggers the release jobs
   (+ `.sha256`) per PHP version, and the `checksums` job attaches a combined
   `SHA256SUMS.txt`. `contents: write` is scoped to those release/packaging jobs
   only; every third-party action is SHA-pinned.
-- **GitLab CI** (`.gitlab-ci.yml`): the `package` stage builds the tarball and a
-  prebuilt `.so`, writes the combined `SHA256SUMS.txt`, and exports its own job
-  id (`PACKAGE_JOB_ID`) plus the exact artifact filenames via a `dotenv`
-  report. The tag-gated `release` stage (`rules: if $CI_COMMIT_TAG`) then
-  creates a GitLab Release via `release-cli` with asset links to all three
-  deliverables — the PECL tarball, the prebuilt `.so`, and `SHA256SUMS.txt` —
-  each pointing at the **package** job's raw artifacts (via `${PACKAGE_JOB_ID}`,
-  not the release job's own id), giving parity with the GitHub release.
+- **GitLab CI** (`.gitlab-ci.yml`): the `package` stage produces the same set of
+  deliverables as GitHub. A `prebuilt` job runs as a `parallel: matrix` over PHP
+  8.2/8.3/8.4 and builds one `pcov-pcov-enhanced-X.Y.Z-phpM.m-linux-<arch>-<ts>.so`
+  per version; a `package` job (php:8.4) builds the PECL tarball; and a
+  `checksums` job `needs` all of them and aggregates the tarball + all three
+  `.so` files into one combined `SHA256SUMS.txt`. Each producer exports its own
+  job id (and the exact artifact filenames) via a `dotenv` report; the matrixed
+  `prebuilt` instances use version-specific keys (`PREBUILT_JOB_ID_82/_83/_84`,
+  `SO_NAME_82/_83/_84`) so their merged reports never collide. The tag-gated
+  `release` stage (`rules: if $CI_COMMIT_TAG`) then creates a GitLab Release via
+  `release-cli` with one asset link per deliverable (the PECL tarball, **one
+  prebuilt `.so` per PHP version (8.2/8.3/8.4)**, and `SHA256SUMS.txt`), each
+  pointing at the raw artifacts of the specific job that produced it (via that
+  job's carried id, not the release job's own id). This gives genuine parity
+  with the GitHub release: the same tarball, the same three per-version prebuilt
+  binaries, and the same combined checksums.
 
 ### Step 4 — MANUAL networked publish steps
 
