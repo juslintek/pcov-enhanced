@@ -118,14 +118,29 @@ package:
     - PHP_MINOR=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
     - ARCH=$(uname -m)
     - TS=$(php -r 'echo PHP_ZTS?"zts":"nts";')
-    - cp modules/pcov.so "pcov-pcov-enhanced-php${PHP_MINOR}-linux-${ARCH}-${TS}.so"
+    - SO_NAME="pcov-pcov-enhanced-php${PHP_MINOR}-linux-${ARCH}-${TS}.so"
+    - cp modules/pcov.so "$SO_NAME"
     - sha256sum pcov_enhanced-*.tgz pcov-pcov-enhanced-*.so > SHA256SUMS.txt
     - cat SHA256SUMS.txt
+    # Carry the exact artifact names and THIS job's id forward to the release
+    # stage via a dotenv report. The release job cannot reference ${CI_JOB_ID}
+    # (that is the release job's own id); it must point raw-artifact links at
+    # the id of the package job that actually produced the files.
+    - TGZ_NAME="$(ls pcov_enhanced-*.tgz)"
+    - |
+      {
+        echo "PACKAGE_JOB_ID=$CI_JOB_ID"
+        echo "TGZ_NAME=$TGZ_NAME"
+        echo "SO_NAME=$SO_NAME"
+      } > package.env
+    - cat package.env
   artifacts:
     paths:
       - pcov_enhanced-*.tgz
       - pcov-pcov-enhanced-*.so
       - SHA256SUMS.txt
+    reports:
+      dotenv: package.env
     expire_in: 30 days
 
 # ---------------------------------------------------------------------------
@@ -137,17 +152,33 @@ release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
+    # `artifacts: true` also imports the dotenv report from `package`, so
+    # PACKAGE_JOB_ID / TGZ_NAME / SO_NAME are available as variables here.
     - job: package
       artifacts: true
   rules:
     - if: $CI_COMMIT_TAG
   script:
     - echo "Publishing GitLab Release for $CI_COMMIT_TAG"
+    - echo "Linking artifacts from package job ${PACKAGE_JOB_ID}:"
+    - echo "  ${TGZ_NAME}, ${SO_NAME}, SHA256SUMS.txt"
   release:
     tag_name: "$CI_COMMIT_TAG"
     name: "pcov-enhanced $CI_COMMIT_TAG"
-    description: "Automated release of pcov-enhanced $CI_COMMIT_TAG. Attaches the PECL tarball, prebuilt modules/pcov.so, and SHA256SUMS.txt as job artifacts."
+    description: "Automated release of pcov-enhanced $CI_COMMIT_TAG. Links the PECL tarball, the prebuilt pcov.so, and SHA256SUMS.txt from the package job's artifacts."
     assets:
+      # Link the actual deliverables (tarball + prebuilt .so + combined
+      # checksums) so this GitLab Release is equivalent to the GitHub one.
+      # Every link targets the PACKAGE job's raw artifacts (via
+      # ${PACKAGE_JOB_ID} carried over dotenv) — using ${CI_JOB_ID} here would
+      # point at the release job, which never produced these files, and 404.
       links:
+        - name: "${TGZ_NAME}"
+          url: "${CI_PROJECT_URL}/-/jobs/${PACKAGE_JOB_ID}/artifacts/raw/${TGZ_NAME}"
+          link_type: "package"
+        - name: "${SO_NAME}"
+          url: "${CI_PROJECT_URL}/-/jobs/${PACKAGE_JOB_ID}/artifacts/raw/${SO_NAME}"
+          link_type: "other"
         - name: "SHA256SUMS.txt"
-          url: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/SHA256SUMS.txt"
+          url: "${CI_PROJECT_URL}/-/jobs/${PACKAGE_JOB_ID}/artifacts/raw/SHA256SUMS.txt"
+          link_type: "other"

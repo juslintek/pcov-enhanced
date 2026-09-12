@@ -23,6 +23,21 @@
 # /usr/local/etc/php/conf.d. The initContainer resolves the real extension_dir
 # at runtime via `php -r 'echo ini_get("extension_dir");'` so it stays correct
 # across PHP patch releases.
+#
+# ==================== extension_dir OVERLAY CAVEAT ==========================
+# The app container mounts the shared `pcov-ext` volume OVER its entire
+# extension_dir. A naive init that copies only pcov.so into that volume would
+# HIDE any extensions the app image already installed there (pdo_mysql,
+# opcache, ...) — only pcov would then load. To avoid that regression this
+# manifest uses TWO init containers:
+#   1. `seed-extensions` runs the APP image and copies ITS existing
+#      extension_dir contents into the shared volume.
+#   2. `install-pcov` runs the pcov-enhanced image and ADDS pcov.so alongside
+#      them (matching PHP API version — see above).
+# If your app image is a stock upstream php:* image with no extra extensions,
+# the seed step is a harmless no-op and you may drop it. The prebuilt-image
+# model (prebuilt-image-example.yaml, the documented default) sidesteps this
+# entirely because the extension is compiled into the image itself.
 # ============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -49,9 +64,30 @@ spec:
           emptyDir: {}
 
       initContainers:
-        # Built from docker/Dockerfile with PHP_VERSION matching the app image.
-        # It already contains a matching pcov.so and the docker-php-ext-pcov.ini
-        # snippet; we just copy them onto the shared volumes.
+        # Step 1: seed the shared volume with the APP image's own extensions so
+        # the overlay mount does not hide them. Runs the SAME image as the app
+        # container, so it sees exactly the extensions the app expects. This is
+        # a no-op for a stock php:* image with an empty extension_dir.
+        - name: seed-extensions
+          image: php:8.3-fpm
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              EXT_DIR="$(php -r 'echo ini_get("extension_dir");')"
+              # Copy any pre-existing extensions from the app image (glob may be
+              # empty on a stock image — that is fine).
+              cp -a "$EXT_DIR"/. /pcov-ext/ 2>/dev/null || true
+              ls -l /pcov-ext/ || true
+          volumeMounts:
+            - name: pcov-ext
+              mountPath: /pcov-ext
+
+        # Step 2: built from docker/Dockerfile with PHP_VERSION matching the app
+        # image. It already contains a matching pcov.so and the
+        # docker-php-ext-pcov.ini snippet; add pcov.so ALONGSIDE the seeded
+        # extensions and write the conf.d snippet.
         - name: install-pcov
           image: ghcr.io/juslintek/pcov-enhanced:8.3
           command:
@@ -82,9 +118,12 @@ spec:
           image: php:8.3-fpm
           command: ["php-fpm"]
           volumeMounts:
-            # Mount the copied extension over the image's extension_dir. Adjust
-            # the mountPath to match `php -i | grep extension_dir` in YOUR image
-            # if it differs (it is stable within a PHP minor version).
+            # Mount the shared volume over the image's extension_dir. It holds
+            # the app image's own extensions (seeded by `seed-extensions`) PLUS
+            # pcov.so (added by `install-pcov`), so nothing the app image
+            # shipped is hidden. Adjust the mountPath to match
+            # `php -i | grep extension_dir` in YOUR image if it differs (it is
+            # stable within a PHP minor version).
             - name: pcov-ext
               mountPath: /usr/local/lib/php/extensions/no-debug-non-zts-20230831
             # Mount only the pcov ini into conf.d via subPath so the base

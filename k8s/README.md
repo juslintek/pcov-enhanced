@@ -27,6 +27,28 @@ snippet into shared `emptyDir` volumes, which are mounted into the app
 container's `extension_dir` and `conf.d`. PHP then loads `pcov` at startup with
 no rebuild of the app image.
 
+### ⚠️ The extension_dir overlay can hide the app's own extensions
+
+The shared `emptyDir` is mounted **over the whole `extension_dir`**, so it
+replaces whatever the app image had there. If the app image installed
+extensions (`docker-php-ext-install pdo_mysql opcache`, ...), a volume holding
+*only* `pcov.so` would hide them and only `pcov` would load — a subtle runtime
+regression.
+
+The example avoids this with **two init containers**:
+
+1. `seed-extensions` runs the **app image** and copies its existing
+   `extension_dir` contents into the shared volume (a harmless no-op on a stock
+   `php:*` image whose `extension_dir` is empty).
+2. `install-pcov` runs the **pcov-enhanced image** and adds `pcov.so`
+   *alongside* the seeded extensions.
+
+The result is a volume containing the app's own extensions **plus** `pcov.so`,
+so nothing is hidden. If your app image is a stock upstream image with no extra
+extensions you may drop the seed step. When in doubt, prefer the prebuilt-image
+model below, which sidesteps the overlay entirely because the extension is
+compiled into the image.
+
 ### ⚠️ PHP API version matching (the one thing that will bite you)
 
 A compiled PHP extension `.so` only loads into a PHP binary whose **PHP API
