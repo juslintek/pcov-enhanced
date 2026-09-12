@@ -3,6 +3,7 @@ Property hooks
 --SKIPIF--
 <?php
 if (!extension_loaded("pcov")) print "skip";
+$__m = getenv("PCOV_MODE"); if ($__m === false || $__m === "") { $__m = (string) ini_get("pcov.mode"); } if (strcasecmp($__m, "branch") === 0 || strcasecmp($__m, "path") === 0) print "skip line-shape test not applicable in branch mode";
 if (PHP_VERSION_ID < 80400) print "skip only for PHP >= 8.4";
 ?>
 --INI--

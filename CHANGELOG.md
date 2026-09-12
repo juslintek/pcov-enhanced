@@ -1,0 +1,70 @@
+# Changelog
+
+All notable changes to this alternative pcov distribution are documented here.
+This project builds and loads as the `pcov` extension and tracks upstream
+[krakjoe/pcov](https://github.com/krakjoe/pcov); entries below describe what
+this distribution adds on top of it.
+
+## [1.1.0] - 2026-09-10
+
+### Added
+- **Branch and path coverage** via a new `pcov.mode` INI setting
+  (`line` default — unchanged behaviour; `branch` enables branch/path).
+  In branch mode, `\pcov\collect()` returns the `{lines, functions}` shape
+  (with per-function `branches` and `paths`) that
+  `phpunit/php-code-coverage` consumes.
+- **Xdebug-compatible surface** (opt-in, only under `pcov.mode=branch`) so
+  that unmodified PHPUnit selects this extension for `--path-coverage`. It
+  registers `XDEBUG_CC_*` / `XDEBUG_PATH_*` / `XDEBUG_FILTER_*` constants and
+  `xdebug_start_code_coverage()`, `xdebug_stop_code_coverage($cleanup)`,
+  `xdebug_get_code_coverage()`, `xdebug_set_filter()`, `xdebug_info()`.
+  - Dormant unless branch mode is requested.
+  - Never registers when the real Xdebug extension is present (Xdebug wins;
+    pcov downgrades to line mode to avoid double instrumentation).
+  - Reports `phpversion('xdebug')` as the sentinel `3.99.0-pcov`.
+- `xdebug_set_filter()` include / exclude / `XDEBUG_FILTER_NONE` path-prefix
+  filtering, applied both at trace time and at collection time.
+- Tests: `014` (branch/path shape), `015` (set_filter exclude), `016`
+  (`xdebug_stop_code_coverage($cleanup)` reset vs preserve).
+
+### Fixed (review round 2)
+- Corrected the xdebug-compat filter constants to Xdebug's real values
+  (`XDEBUG_FILTER_CODE_COVERAGE=256`, `XDEBUG_PATH_INCLUDE=1`,
+  `XDEBUG_PATH_EXCLUDE=2`, `XDEBUG_FILTER_NONE=0`) and the include/exclude/none
+  list-type mapping, so php-code-coverage's `XdebugDriver` filter calls are
+  honored instead of silently ignored.
+- Bounds-check every opcode index derived from a jump operand before use in the
+  branch analysis (prevents an out-of-bounds read on malformed/edge-case CFGs).
+- Normalize a missing `$filter` argument to an empty array in `\pcov\collect()`
+  so include/exclude paths never dereference NULL.
+- Cache the CFG analysis for never-executed functions (with empty hit sets)
+  instead of rebuilding and re-enumerating paths on every `collect()`.
+- Tie each branch cache entry to the op_array's identity (filename + line +
+  size); a reused `opcodes` address is detected and the stale entry rebuilt.
+- Report exit-edge `out_hit` from the recorded runtime exit transition, so a
+  `ZEND_LAST_CATCH` whose catch matched no longer reports its exit edge taken.
+- Line-shape `.phpt` guards now honor `PCOV_MODE` precedence and treat `path`
+  as branch mode; the cleanup test also asserts coverage is preserved after
+  `xdebug_stop_code_coverage(false)`.
+
+### Fixed (review round 4)
+- Detach/finalize any live runtime frame whose cached analysis is being evicted
+  (stale `opcodes`-address collision) before freeing it, preventing a
+  use-after-free through `pcov_frame_t.cache`.
+- Bounds-check path-enumeration targets so a jump-derived index can never read
+  `info->branches` out of range.
+- Pin the third-party release action to a full commit SHA and scope
+  `contents: write` to the packaging job only (supply-chain hardening).
+
+### Notes
+- Branch analysis is a faithful port of Xdebug 3.6's control-flow and
+  path-enumeration logic; path enumeration is capped identically (4096 paths).
+- Branch/path coverage costs roughly 1.5–2× pcov line coverage and remains
+  dramatically cheaper than Xdebug path coverage.
+- Validated on PHP 8.2–8.5; Valgrind-clean including the frameless internal
+  call case that historically broke Xdebug 3.5.
+
+## Upstream base
+
+Based on pcov 1.0.x (`krakjoe/pcov`). See that project for the history of the
+line-coverage driver this distribution extends.

@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package packagerversion="1.10.0" version="2.0"
+    xmlns="http://pear.php.net/dtd/package-2.0"
+    xmlns:tasks="http://pear.php.net/dtd/tasks-1.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://pear.php.net/dtd/tasks-1.0
+http://pear.php.net/dtd/tasks-1.0.xsd
+http://pear.php.net/dtd/package-2.0
+http://pear.php.net/dtd/package-2.0.xsd">
+ <name>pcov_enhanced</name>
+ <channel>pecl.php.net</channel>
+ <summary>An alternative pcov build adding branch and path coverage (like Xdebug, far faster).</summary>
+ <description>
+pcov_enhanced is a drop-in alternative to the pcov extension. It builds and
+loads as the "pcov" extension, so line coverage behaves exactly like upstream
+pcov, and existing tooling keeps working unchanged.
+
+Setting pcov.mode=branch additionally collects branch and path coverage in the
+same shape php-code-coverage consumes, so `phpunit --path-coverage` works while
+keeping pcov's very low overhead — orders of magnitude faster than Xdebug path
+coverage.
+
+This is an unofficial, community distribution based on krakjoe/pcov.
+ </description>
+ <lead>
+  <name>Joe Watkins</name>
+  <user>krakjoe</user>
+  <email>krakjoe@php.net</email>
+  <active>no</active>
+ </lead>
+ <lead>
+  <name>Linas Jusys</name>
+  <user>juslintek</user>
+  <email>jusys.linas@gmail.com</email>
+  <active>yes</active>
+ </lead>
+ <date>2026-09-11</date>
+ <version>
+  <release>1.1.0</release>
+  <api>1.1.0</api>
+ </version>
+ <stability>
+  <release>beta</release>
+  <api>stable</api>
+ </stability>
+ <license uri="http://www.php.net/license">PHP-3.01</license>
+ <notes>
+Adds opt-in branch and path coverage via pcov.mode=branch:
+ - Branch/path analysis ported from Xdebug 3.6, matching its output shape.
+ - Optional xdebug-compatible surface so unmodified phpunit --path-coverage
+   selects this extension (dormant unless pcov.mode=branch; never overrides a
+   real Xdebug; reports phpversion('xdebug') as the sentinel 3.99.0-pcov).
+ - Line coverage and the default behaviour are unchanged from upstream pcov.
+ </notes>
+ <contents>
+  <dir name="/">
+   <file role="doc" name="LICENSE"/>
+   <file role="doc" name="README.md"/>
+   <file role="doc" name="INSTALL.md"/>
+   <file role="doc" name="CHANGELOG.md"/>
+   <dir name="docs">
+    <file role="doc" name="01-contract.md"/>
+    <file role="doc" name="02-integration-decision.md"/>
+    <file role="doc" name="03-results.md"/>
+    <file role="doc" name="04-distribution.md"/>
+   </dir>
+   <file role="src" name="config.m4"/>
+   <file role="src" name="config.w32"/>
+   <file role="src" name="php_pcov.h"/>
+   <file role="src" name="pcov.c"/>
+   <file role="src" name="pcov_branch.h"/>
+   <file role="src" name="pcov_branch.c"/>
+   <file role="src" name="pcov_xdebug_compat.h"/>
+   <file role="src" name="pcov_xdebug_compat.c"/>
+   <dir name="cfg">
+    <dir name="701">
+     <file role="src" name="zend_cfg.c"/>
+     <file role="src" name="zend_cfg.h"/>
+     <file role="src" name="zend_worklist.h"/>
+    </dir>
+    <dir name="702">
+     <file role="src" name="zend_cfg.c"/>
+     <file role="src" name="zend_cfg.h"/>
+     <file role="src" name="zend_worklist.h"/>
+    </dir>
+    <dir name="703">
+     <file role="src" name="zend_cfg.c"/>
+     <file role="src" name="zend_cfg.h"/>
+     <file role="src" name="zend_worklist.h"/>
+    </dir>
+    <dir name="704">
+     <file role="src" name="zend_cfg.c"/>
+     <file role="src" name="zend_cfg.h"/>
+     <file role="src" name="zend_worklist.h"/>
+    </dir>
+   </dir>
+   <dir name="tests">
+    <file role="test" name="001.phpt"/>
+    <file role="test" name="002.phpt"/>
+    <file role="test" name="003.phpt"/>
+    <file role="test" name="004.phpt"/>
+    <file role="test" name="005.phpt"/>
+    <file role="test" name="006.phpt"/>
+    <file role="test" name="007.phpt"/>
+    <file role="test" name="008.phpt"/>
+    <file role="test" name="009.phpt"/>
+    <file role="test" name="010.phpt"/>
+    <file role="test" name="011.phpt"/>
+    <file role="test" name="012.phpt"/>
+    <file role="test" name="013.phpt"/>
+    <file role="test" name="014.phpt"/>
+    <file role="test" name="015.phpt"/>
+    <file role="test" name="016.phpt"/>
+    <file role="test" name="hooks.phpt"/>
+   </dir>
+  </dir>
+ </contents>
+ <dependencies>
+  <required>
+   <php>
+    <min>7.1.0</min>
+   </php>
+   <pearinstaller>
+    <min>1.4.0</min>
+   </pearinstaller>
+  </required>
+ </dependencies>
+ <providesextension>pcov</providesextension>
+ <extsrcrelease>
+  <configureoption name="enable-pcov" prompt="Enable php coverage support" default="yes"/>
+ </extsrcrelease>
+</package>

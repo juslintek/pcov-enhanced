@@ -1,15 +1,33 @@
 PCOV
 ====
 
-[![Build Status](https://travis-ci.org/krakjoe/pcov.svg?branch=develop)](https://travis-ci.org/krakjoe/pcov)
-[![Build status](https://ci.appveyor.com/api/projects/status/w265n0w7yk6o3y6m?svg=true)](https://ci.appveyor.com/project/krakjoe/pcov)
+[![CI](https://github.com/juslintek/pcov-enhanced/actions/workflows/ci.yml/badge.svg)](https://github.com/juslintek/pcov-enhanced/actions/workflows/ci.yml)
 
 A self contained [CodeCoverage](https://github.com/sebastianbergmann/php-code-coverage) compatible driver for PHP
+
+> **This is an alternative pcov build that adds branch and path coverage**
+> (like Xdebug, but far faster). It is a drop-in replacement for pcov: line
+> coverage behaves exactly as upstream, and `pcov.mode=branch` additionally
+> provides branch/path coverage consumable through `phpunit --path-coverage`.
+> See the [branch/path coverage](#branch-and-path-coverage-pcovmodebranch)
+> section below.
+
+## Continuous integration & reports
+
+The [CI workflow](.github/workflows/ci.yml) builds the extension across a PHP
+8.2–8.4 matrix (opcache on/off), runs the `.phpt` suite in both line and branch
+mode, runs the suite under Valgrind, and generates **branch** and **path**
+coverage reports (Markdown tables, `coverage.json`, a PHPUnit HTML report and a
+Cobertura XML) which are published to the job summary and uploaded as the
+`coverage-reports` artifact.
 
 Requirements and Installation
 =============================
 
-See [INSTALL.md](INSTALL.md)
+See [INSTALL.md](INSTALL.md) for build-from-source, PECL tarball, and Composer
+installation, and [docs/04-distribution.md](docs/04-distribution.md) for the
+full distribution/registry guide. This build installs as the `pcov` extension
+and replaces upstream pcov (only one may be installed at a time).
 
 
 API
@@ -71,6 +89,33 @@ PCOV is configured using PHP.ini:
 | `pcov.exclude`         | unused             | SYSTEM,PERDIR  | exclude files under pcov.directory matching this PCRE |
 | `pcov.initial.memory`  | 65536              | SYSTEM,PERDIR  | shall set initial size of arena                       |
 | `pcov.initial.files`   | 64                 | SYSTEM,PERDIR  | shall set initial size of tables                      |
+| `pcov.mode`            | line               | SYSTEM         | `line` (default) or `branch` for branch/path coverage; startup-only (must be set before startup, e.g. `-d`/php.ini or `PCOV_MODE`, not `.user.ini`) |
+
+Branch and path coverage (`pcov.mode=branch`)
+----------------------------------------------
+
+By default PCOV collects line coverage only, exactly as before. Setting
+`pcov.mode=branch` (or the environment variable `PCOV_MODE=branch`) additionally
+collects **branch and path coverage** in the same shape Xdebug produces, so it
+can be consumed by `phpunit --path-coverage`.
+
+`\pcov\collect()` then returns, per file, `['lines' => ..., 'functions' => ...]`
+where each function carries `branches` and `paths` compatible with
+`SebastianBergmann\CodeCoverage`.
+
+To make **unmodified** PHPUnit / php-code-coverage drive PCOV for path coverage,
+branch mode also exposes an opt-in Xdebug-compatible surface (the `XDEBUG_CC_*`
+constants and `xdebug_*` coverage functions). This surface:
+
+  * is **only** active when `pcov.mode=branch`; line mode is unchanged,
+  * **never** registers when the real Xdebug extension is loaded (Xdebug wins;
+    PCOV downgrades to line mode to avoid double instrumentation),
+  * reports `phpversion('xdebug')` as the sentinel `3.99.0-pcov`, so it is
+    clearly identifiable and not mistaken for a real Xdebug build.
+
+Branch/path coverage costs roughly `1.5`–`2x` PCOV line coverage and remains
+dramatically cheaper than Xdebug path coverage. See `docs/` for the full
+contract, the integration-route decision, and validation results.
 
 Notes
 -----

@@ -1,0 +1,17 @@
+{
+    "name": "pcov/branch-path-report-fixture",
+    "description": "Fixture project used by CI to generate branch and path coverage reports with pcov branch mode.",
+    "type": "project",
+    "require-dev": {
+        "phpunit/phpunit": "^10 || ^11"
+    },
+    "autoload": {
+        "psr-4": { "Sample\\": "src/" }
+    },
+    "autoload-dev": {
+        "psr-4": { "Sample\\Tests\\": "tests/" }
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

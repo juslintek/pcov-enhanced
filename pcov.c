@@ -39,6 +39,8 @@
 #include "zend_vm_opcodes.h"
 
 #include "php_pcov.h"
+#include "pcov_branch.h"
+#include "pcov_xdebug_compat.h"
 
 #define PCOV_FILTER_ALL     0
 #define PCOV_FILTER_INCLUDE 1
@@ -141,7 +143,505 @@ PHP_INI_BEGIN()
 		"pcov.initial.files", "64",
 		PHP_INI_SYSTEM | PHP_INI_PERDIR, OnUpdateLong,
 		ini.files, zend_pcov_globals, pcov_globals)
+	STD_PHP_INI_ENTRY  (
+		/* SYSTEM-only: the xdebug-compat surface is decided at MINIT, before
+		 * CGI/FastCGI applies per-directory (.user.ini) values. Allowing PERDIR
+		 * here would let .user.ini request branch mode at RINIT while the fake
+		 * xdebug module / xdebug_* functions were never registered, so PHPUnit
+		 * could not select its path-coverage driver. Keep it a startup setting. */
+		"pcov.mode", "line",
+		PHP_INI_SYSTEM, OnUpdateString,
+		ini.mode, zend_pcov_globals, pcov_globals)
 PHP_INI_END()
+
+/* Resolve pcov.mode / PCOV_MODE env into PCOV_MODE_*. Branch mode is strictly
+ * opt-in; anything unrecognized is line mode, so default behavior never
+ * changes. */
+static zend_always_inline int php_pcov_resolve_mode(void) {
+	const char *env = getenv("PCOV_MODE");
+	/* An exported-but-empty PCOV_MODE is treated as unset, falling back to
+	 * pcov.mode (the .phpt guards use the same rule). */
+	const char *mode = (env && *env) ? env : INI_STR("pcov.mode");
+
+	if (mode && (strcasecmp(mode, "branch") == 0 || strcasecmp(mode, "path") == 0)) {
+		/* Guardrail: if the real Xdebug extension is present, it owns coverage
+		 * instrumentation. Running pcov's branch tracking alongside it doubles
+		 * the opcode instrumentation and can corrupt state, so we downgrade to
+		 * line mode and let Xdebug provide branch/path coverage. (The
+		 * xdebug-compat shim also declines to register in this case.) */
+		if (zend_hash_str_exists(&module_registry, "xdebug", sizeof("xdebug") - 1) &&
+		    !php_pcov_xdebug_compat_active()) {
+			return PCOV_MODE_LINE;
+		}
+		return PCOV_MODE_BRANCH;
+	}
+	return PCOV_MODE_LINE;
+}
+
+/*
+ * Per-op_array runtime cache (branch mode). Keyed in PCG(reached) by the
+ * op_array's opcodes pointer (stable across the request while the op_array
+ * lives, which pcov guarantees by refcounting them in PCG(files)).
+ *
+ * Holds:
+ *   info      : the static branch/path analysis, built once per op_array.
+ *   reached   : opcode-index bitset of branch starts entered (branch hit).
+ *   path_hits : path-index bitset of enumerated paths traversed as a unit.
+ */
+typedef struct _php_pcov_reached_t {
+	pcov_branch_info *info;
+	zend_bitset       reached;      /* size zend_bitset_len(nops) */
+	uint32_t          reached_bits; /* == op_array->last */
+	zend_bitset       path_hits;    /* size zend_bitset_len(paths_count) */
+	uint32_t          path_hits_bits;
+	zend_bitset       edges;        /* traversed out-edges (see edge index)   */
+	uint32_t          edges_bits;   /* size*(1+highest_out)                    */
+	/* Identity of the op_array this entry was built for. The cache is keyed by
+	 * the (opcodes) address, which Zend can reuse after a transient op_array is
+	 * freed; these let us detect a stale hit and rebuild instead of returning
+	 * a mismatched CFG/hit-set. */
+	zend_string      *id_filename;  /* borrowed ref to op_array->filename     */
+	uint32_t          id_line_start;
+	uint32_t          id_last;
+} php_pcov_reached_t;
+
+static void php_pcov_reached_dtor(zval *zv) {
+	php_pcov_reached_t *r = (php_pcov_reached_t *) Z_PTR_P(zv);
+	if (r->info) {
+		pcov_branch_info_free(r->info);
+	}
+	if (r->reached) {
+		efree(r->reached);
+	}
+	if (r->path_hits) {
+		efree(r->path_hits);
+	}
+	if (r->edges) {
+		efree(r->edges);
+	}
+	if (r->id_filename) {
+		zend_string_release(r->id_filename);
+	}
+	efree(r);
+}
+
+/* Finalize and detach any live frame whose cached analysis is `r`, so the
+ * entry can be freed without leaving a dangling pcov_frame_t.cache. Defined
+ * after the frame stack; forward-declared here. */
+static void php_pcov_frames_detach_cache(php_pcov_reached_t *r);
+
+/* Get-or-build the cache entry for an op_array. NULL if not analyzable. */
+static php_pcov_reached_t *php_pcov_reached_get(zend_op_array *op_array) {
+	php_pcov_reached_t *r;
+	zend_ulong key = (zend_ulong) (uintptr_t) op_array->opcodes;
+
+	/* Do not cache transient op_arrays. Eval code (and other non-user code) is
+	 * destroyed after execution, after which its `opcodes` address may be
+	 * reused by a different op_array; a cache keyed on that address would then
+	 * return a stale CFG/hit-set. pcov only retains ZEND_USER_FUNCTION
+	 * op_arrays (refcounted in PCG(files) / the function tables) for the whole
+	 * request, so restrict caching to those. The runtime trace hook already
+	 * gates on the same type. */
+	if (op_array->type != ZEND_USER_FUNCTION) {
+		return NULL;
+	}
+
+	r = zend_hash_index_find_ptr(&PCG(reached), key);
+	if (EXPECTED(r)) {
+		/* Validate that this cache entry still belongs to the same op_array:
+		 * the keyed `opcodes` address can be reused after a transient op_array
+		 * (e.g. a function defined inside an include/eval) is freed. If the
+		 * identity differs, the entry is stale — evict and rebuild. */
+		if (r->id_last == op_array->last &&
+		    r->id_line_start == (uint32_t) op_array->line_start &&
+		    ((r->id_filename == NULL && op_array->filename == NULL) ||
+		     (r->id_filename != NULL && op_array->filename != NULL &&
+		      zend_string_equals(r->id_filename, op_array->filename)))) {
+			return r;
+		}
+		/* A returned-but-not-yet-finalized frame in PCG(frames) may still hold
+		 * this entry as a raw `cache` pointer. Finalize+detach those frames
+		 * BEFORE the dtor frees the entry, so php_pcov_frame_finalize() can
+		 * never dereference freed memory through cache->info / cache->edges. */
+		php_pcov_frames_detach_cache(r);
+		zend_hash_index_del(&PCG(reached), key); /* dtor frees the stale entry */
+	}
+
+	if (op_array->last == 0 || (op_array->fn_flags & ZEND_ACC_ABSTRACT)) {
+		return NULL;
+	}
+
+	r = ecalloc(1, sizeof(php_pcov_reached_t));
+	r->info = pcov_branch_info_create_from_oparray(op_array);
+	if (!r->info) {
+		efree(r);
+		return NULL;
+	}
+	r->reached_bits   = op_array->last;
+	r->reached        = ecalloc(zend_bitset_len(r->reached_bits), sizeof(zend_ulong));
+	r->path_hits_bits = r->info->paths_count;
+	r->path_hits      = r->path_hits_bits
+		? ecalloc(zend_bitset_len(r->path_hits_bits), sizeof(zend_ulong))
+		: NULL;
+	r->edges_bits     = r->info->size * (uint32_t)(1 + r->info->highest_out) + 1;
+	r->edges          = ecalloc(zend_bitset_len(r->edges_bits), sizeof(zend_ulong));
+	r->id_filename    = op_array->filename ? zend_string_copy(op_array->filename) : NULL;
+	r->id_line_start  = (uint32_t) op_array->line_start;
+	r->id_last        = op_array->last;
+
+	zend_hash_index_add_ptr(&PCG(reached), key, r);
+	return r;
+}
+
+static zend_always_inline php_pcov_reached_t *php_pcov_reached_find(zend_op_array *op_array) {
+	zend_ulong key = (zend_ulong) (uintptr_t) op_array->opcodes;
+	return zend_hash_index_find_ptr(&PCG(reached), key);
+}
+
+/*
+ * Runtime frame stack for per-invocation path recording. Each live PHP frame
+ * that we are tracking has an entry recording the ordered sequence of branch
+ * starts entered (deduplicated against the immediately previous branch, as
+ * Xdebug does). On frame exit the sequence is matched against the function's
+ * enumerated paths and, on exact match, the corresponding path is marked hit.
+ */
+typedef struct _pcov_frame_t {
+	zend_execute_data *ex;         /* frame identity (VM stack slot)          */
+	void              *op_opcodes; /* op_array->opcodes: disambiguates reuse  */
+	php_pcov_reached_t *cache;     /* cached analysis for this op_array       */
+	uint32_t          *seq;        /* branch-id sequence                      */
+	uint32_t           seq_len;
+	uint32_t           seq_size;
+	int32_t            last;       /* last branch id appended (-1 = none)     */
+} pcov_frame_t;
+
+typedef struct _pcov_frame_stack_t {
+	pcov_frame_t *frames;
+	uint32_t      count;
+	uint32_t      size;
+} pcov_frame_stack_t;
+
+static pcov_frame_stack_t *php_pcov_frames(void) {
+	pcov_frame_stack_t *s = (pcov_frame_stack_t *) PCG(frames);
+	if (!s) {
+		s = ecalloc(1, sizeof(pcov_frame_stack_t));
+		PCG(frames) = s;
+	}
+	return s;
+}
+
+/* Match a completed frame's branch sequence against enumerated paths. */
+static void php_pcov_frame_finalize(pcov_frame_t *f) {
+	if (f->cache && f->cache->info && f->cache->path_hits && f->seq_len) {
+		pcov_branch_mark_path_hit(f->cache->info, f->cache->path_hits, f->seq, f->seq_len);
+	}
+	/* The invocation ended at its last recorded branch; if that branch has an
+	 * EXIT out-edge, that exit was actually taken. Record it so out_hit for
+	 * exit edges reflects a real traversal rather than mere branch reachability
+	 * (matters for ZEND_LAST_CATCH, which has both a fall-through and an EXIT
+	 * successor). */
+	if (f->cache && f->cache->info && f->cache->edges && f->seq_len) {
+		uint32_t term = f->seq[f->seq_len - 1];
+		if (term < f->cache->info->size) {
+			pcov_branch *pb = &f->cache->info->branches[term];
+			uint32_t j;
+			for (j = 0; j < pb->outs_count; j++) {
+				if (pb->outs[j] == PCOV_JMP_EXIT) {
+					uint32_t ei = pcov_branch_edge_index(f->cache->info, term, j);
+					if (ei < f->cache->edges_bits) {
+						zend_bitset_incl(f->cache->edges, ei);
+					}
+				}
+			}
+		}
+	}
+	if (f->seq) {
+		efree(f->seq);
+		f->seq = NULL;
+	}
+	f->seq_len = f->seq_size = 0;
+	f->ex = NULL;
+	f->op_opcodes = NULL;
+	f->cache = NULL;
+	f->last = -1;
+}
+
+static void php_pcov_frames_dtor(void) {
+	pcov_frame_stack_t *s = (pcov_frame_stack_t *) PCG(frames);
+	uint32_t i;
+	if (!s) {
+		return;
+	}
+	for (i = 0; i < s->count; i++) {
+		php_pcov_frame_finalize(&s->frames[i]);
+	}
+	if (s->frames) {
+		efree(s->frames);
+	}
+	efree(s);
+	PCG(frames) = NULL;
+}
+
+static void php_pcov_frames_reset(void) {
+	pcov_frame_stack_t *s = (pcov_frame_stack_t *) PCG(frames);
+	uint32_t i;
+	if (!s) {
+		return;
+	}
+	for (i = 0; i < s->count; i++) {
+		if (s->frames[i].seq) {
+			efree(s->frames[i].seq);
+			s->frames[i].seq = NULL;
+		}
+	}
+	s->count = 0;
+}
+
+/* Is this frame still live on the current VM call stack? Matches on BOTH the
+ * execute_data pointer AND the op_array identity: VM stack slots are reused, so
+ * a returned frame's `ex` can coincide with a live frame running a different
+ * op_array. Requiring the opcodes pointer to match too avoids treating such a
+ * returned frame as still live (which would leave its final path unfinalized). */
+static int php_pcov_frame_is_live(zend_execute_data *ex, void *op_opcodes) {
+	zend_execute_data *cur = EG(current_execute_data);
+	while (cur) {
+		if (cur == ex && cur->func &&
+		    (void *) cur->func->op_array.opcodes == op_opcodes) {
+			return 1;
+		}
+		cur = cur->prev_execute_data;
+	}
+	return 0;
+}
+
+/* Finalize and drop only frames whose functions have already returned (are no
+ * longer on the live VM stack), preserving still-active frames. Used by stop()
+ * and collect() so a collect() taken mid-execution does not split a live
+ * function's path into unmatchable prefix/suffix sequences. */
+static void php_pcov_frames_finalize_returned(void) {
+	pcov_frame_stack_t *s = (pcov_frame_stack_t *) PCG(frames);
+	uint32_t i, w = 0;
+	if (!s) {
+		return;
+	}
+	for (i = 0; i < s->count; i++) {
+		if (php_pcov_frame_is_live(s->frames[i].ex, s->frames[i].op_opcodes)) {
+			/* keep: compact toward the front, preserving order */
+			if (w != i) {
+				s->frames[w] = s->frames[i];
+			}
+			w++;
+		} else {
+			php_pcov_frame_finalize(&s->frames[i]);
+		}
+	}
+	s->count = w;
+}
+
+/* Finalize and remove every frame whose cached analysis is `r`. Called just
+ * before a stale reached-cache entry is freed so no pcov_frame_t retains a
+ * dangling `cache` pointer (which php_pcov_frame_finalize would later
+ * dereference). Finalizing here still records the frame's path against the
+ * (about-to-be-freed) entry, which is harmless — the entry is being discarded
+ * as stale anyway. */
+static void php_pcov_frames_detach_cache(php_pcov_reached_t *r) {
+	pcov_frame_stack_t *s = (pcov_frame_stack_t *) PCG(frames);
+	uint32_t i, w = 0;
+	if (!s || !r) {
+		return;
+	}
+	for (i = 0; i < s->count; i++) {
+		if (s->frames[i].cache == r) {
+			php_pcov_frame_finalize(&s->frames[i]); /* frees seq, clears cache */
+		} else {
+			if (w != i) {
+				s->frames[w] = s->frames[i];
+			}
+			w++;
+		}
+	}
+	s->count = w;
+}
+
+static void php_pcov_frame_append(pcov_frame_t *f, uint32_t branch_id) {
+	/* Dedup: xdebug records a branch start only the first consecutive time. */
+	if (f->last == (int32_t) branch_id) {
+		return;
+	}
+	if (f->seq_len == f->seq_size) {
+		f->seq_size += 32;
+		f->seq = erealloc(f->seq, sizeof(uint32_t) * f->seq_size);
+	}
+	f->seq[f->seq_len++] = branch_id;
+	f->last = (int32_t) branch_id;
+}
+
+/*
+ * Reconcile the live PHP call stack with our tracked frame stack, then record
+ * the current opcode if it is a branch start.
+ *
+ * We use the machine-stack ordering of zend_execute_data pointers: a deeper
+ * (more recently entered) frame lives at a lower address than its caller on
+ * the VM stack, but rather than rely on address direction we track by exact
+ * pointer identity: when EX changes to a pointer we already have on the stack
+ * we pop everything above it (those frames returned); when it is new we push.
+ */
+static zend_always_inline void php_pcov_path_trace(zend_execute_data *execute_data, zend_op_array *op_array) {
+	pcov_frame_stack_t *s = php_pcov_frames();
+	pcov_frame_t *top;
+	php_pcov_reached_t *cache;
+	uint32_t idx;
+	int found_at = -1;
+	uint32_t i;
+
+	/* Is this execute_data already a tracked frame? A frame matches only when
+	 * BOTH the execute_data pointer AND the op_array identity match: VM stack
+	 * slots are reused across calls, so the same ex pointer with a different
+	 * op_array means the previous occupant returned. */
+	for (i = s->count; i > 0; i--) {
+		if (s->frames[i - 1].ex == execute_data &&
+		    s->frames[i - 1].op_opcodes == (void *) op_array->opcodes) {
+			found_at = (int) (i - 1);
+			break;
+		}
+	}
+
+	if (found_at >= 0) {
+		/* Frames above found_at have returned: finalize and pop them. */
+		while (s->count > (uint32_t) found_at + 1) {
+			php_pcov_frame_finalize(&s->frames[s->count - 1]);
+			s->count--;
+		}
+		top = &s->frames[found_at];
+	} else {
+		/* New frame. Its op_array must be analyzable to track paths. */
+		cache = php_pcov_reached_get(op_array);
+		if (!cache) {
+			return;
+		}
+		if (s->count == s->size) {
+			s->size += 16;
+			s->frames = erealloc(s->frames, sizeof(pcov_frame_t) * s->size);
+		}
+		top = &s->frames[s->count++];
+		top->ex = execute_data;
+		top->op_opcodes = (void *) op_array->opcodes;
+		top->cache = cache;
+		top->seq = NULL;
+		top->seq_len = top->seq_size = 0;
+		top->last = -1;
+	}
+
+	/* Record branch start + branch-hit for the current opcode. */
+	cache = top->cache;
+	if (!cache || !cache->info) {
+		return;
+	}
+	idx = (uint32_t) (execute_data->opline - op_array->opcodes);
+
+	/* Re-entry detection: the VM reuses stack slots, so a fresh invocation of
+	 * the same function lands on the same (ex, opcodes) frame. When we observe
+	 * an entry point again after having already recorded a sequence, the
+	 * previous invocation ended: finalize its path, then start a new one. This
+	 * is the pcov analogue of xdebug's entry_point re-entry handling. */
+	if (top->seq_len > 0 && idx < cache->info->size &&
+	    zend_bitset_in(cache->info->entry_points, idx)) {
+		php_pcov_frame_finalize(top);
+		/* finalize cleared identity fields; restore this live frame */
+		top->ex = execute_data;
+		top->op_opcodes = (void *) op_array->opcodes;
+		top->cache = cache;
+	}
+
+	if (pcov_branch_is_start(cache->info, idx)) {
+		if (idx < cache->reached_bits) {
+			zend_bitset_incl(cache->reached, idx);
+		}
+		/* Record the actually-traversed edge (prev_branch -> idx) rather than
+		 * inferring it from cumulative reachability. Find the out-index of the
+		 * previous branch whose target is idx and mark that edge. */
+		if (top->last >= 0 && cache->edges) {
+			pcov_branch *pb = &cache->info->branches[top->last];
+			uint32_t j;
+			for (j = 0; j < pb->outs_count; j++) {
+				if (pb->outs[j] == (int) idx) {
+					uint32_t ei = pcov_branch_edge_index(cache->info, (uint32_t) top->last, j);
+					if (ei < cache->edges_bits) {
+						zend_bitset_incl(cache->edges, ei);
+					}
+				}
+			}
+		}
+		php_pcov_frame_append(top, idx);
+	}
+}
+
+/* Forward decls for functions used by the xdebug-compat shim. */
+static void php_pcov_collect_common(zval *return_value, zend_long type, zval *filter);
+static zend_always_inline void php_pcov_clean(HashTable *table);
+static zend_always_inline zend_bool php_pcov_filter_admits(zend_string *filename);
+
+/* Whether branch mode is requested. Usable at MINIT (env or ini string),
+ * before RINIT resolves PCG(mode). */
+int php_pcov_branch_mode_requested(void) {
+	return php_pcov_resolve_mode() == PCOV_MODE_BRANCH;
+}
+
+/* Non-static wrapper so the xdebug-compat shim can gate registration on the
+ * same enabled state RINIT uses (pcov.enabled / PCOV_ENABLED). */
+int php_pcov_is_api_enabled(void) {
+	return php_pcov_api_enabled() ? 1 : 0;
+}
+
+void php_pcov_start_internal(void) {
+	if (!php_pcov_api_enabled()) {
+		return;
+	}
+	PCG(enabled) = 1;
+}
+
+/* Reset accumulated coverage state. Mirrors \pcov\clear(): when files is true
+ * the discovered-file tables are dropped too. Declared here and reused by the
+ * xdebug-compat stop($cleanup=true) path so both share one reset. */
+void php_pcov_clear_internal(int files) {
+	if (files) {
+		php_pcov_clean(&PCG(files));
+		php_pcov_clean(&PCG(discovered));
+	}
+
+	zend_arena_destroy(PCG(mem));
+	PCG(mem) = zend_arena_create(INI_INT("pcov.initial.memory"));
+
+	PCG(start) = NULL;
+	PCG(last)  = NULL;
+	PCG(next)  = NULL;
+
+	php_pcov_clean(&PCG(waiting));
+	php_pcov_clean(&PCG(covered));
+	php_pcov_clean(&PCG(reached));
+	php_pcov_frames_reset();
+}
+
+void php_pcov_stop_internal(int cleanup) {
+	if (!php_pcov_api_enabled()) {
+		return;
+	}
+	PCG(enabled) = 0;
+
+	/* Finalize any frames whose functions have already returned so their
+	 * per-invocation path sequences are matched before state may be cleared. */
+	php_pcov_frames_finalize_returned();
+
+	/* xdebug_stop_code_coverage($cleanup=true) discards collected data so the
+	 * next run starts clean; $cleanup=false preserves it. */
+	if (cleanup) {
+		php_pcov_clear_internal(0);
+	}
+}
+
+void php_pcov_collect_into(zval *return_value, zend_long type, zval *filter) {
+	php_pcov_collect_common(return_value, type, filter);
+}
 
 static PHP_GINIT_FUNCTION(pcov)
 {
@@ -152,9 +652,76 @@ static PHP_GINIT_FUNCTION(pcov)
 	ZEND_SECURE_ZERO(pcov_globals, sizeof(zend_pcov_globals));
 }
 
+/* Apply the xdebug_set_filter() path-prefix filter (case-insensitive, matching
+ * Xdebug semantics). Returns 1 if the file is admitted by the current filter,
+ * 0 if it is filtered out. When no filter is active, everything is admitted. */
+static zend_always_inline zend_bool php_pcov_filter_admits(zend_string *filename) {
+	zend_string *prefix;
+	zend_bool matched = 0;
+
+	if (PCG(filter_mode) == PCOV_FILTER_MODE_NONE || !PCG(filter_paths_init)) {
+		return 1;
+	}
+
+	ZEND_HASH_FOREACH_STR_KEY(&PCG(filter_paths), prefix) {
+		if (prefix && ZSTR_LEN(filename) >= ZSTR_LEN(prefix) &&
+		    zend_binary_strncasecmp(
+		        ZSTR_VAL(filename), ZSTR_LEN(filename),
+		        ZSTR_VAL(prefix), ZSTR_LEN(prefix),
+		        ZSTR_LEN(prefix)) == 0) {
+			matched = 1;
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	if (PCG(filter_mode) == PCOV_FILTER_MODE_INCLUDE) {
+		return matched;      /* include: only listed prefixes */
+	}
+	return matched ? 0 : 1;  /* exclude: everything but listed prefixes */
+}
+
+/* Called by the xdebug-compat xdebug_set_filter(). list_type follows Xdebug:
+ * 1 = XDEBUG_PATH_INCLUDE, 0 = XDEBUG_PATH_EXCLUDE, anything else (e.g.
+ * XDEBUG_FILTER_NONE = -1) clears the filter. configuration is an array of
+ * path-prefix strings. Resets the wants/ignores caches so the new filter is
+ * applied consistently. */
+void php_pcov_compat_set_filter(zend_long list_type, zval *configuration) {
+	zval *entry;
+
+	if (!PCG(filter_paths_init)) {
+		zend_hash_init(&PCG(filter_paths), 8, NULL, NULL, 0);
+		PCG(filter_paths_init) = 1;
+	} else {
+		zend_hash_clean(&PCG(filter_paths));
+	}
+
+	if (list_type == PCOV_XDEBUG_LIST_PATH_INCLUDE) {
+		PCG(filter_mode) = PCOV_FILTER_MODE_INCLUDE;
+	} else if (list_type == PCOV_XDEBUG_LIST_PATH_EXCLUDE) {
+		PCG(filter_mode) = PCOV_FILTER_MODE_EXCLUDE;
+	} else {
+		/* XDEBUG_FILTER_NONE (0) or anything unrecognized clears the filter. */
+		PCG(filter_mode) = PCOV_FILTER_MODE_NONE;
+	}
+
+	if (PCG(filter_mode) != PCOV_FILTER_MODE_NONE && configuration) {
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(configuration), entry) {
+			if (Z_TYPE_P(entry) == IS_STRING && Z_STRLEN_P(entry) > 0) {
+				/* zend_hash_add_empty_element takes its own reference on the
+				 * key; do not pass an extra zend_string_copy or it leaks. */
+				zend_hash_add_empty_element(&PCG(filter_paths), Z_STR_P(entry));
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	/* Filter changed: drop the admission caches so decisions are re-evaluated. */
+	php_pcov_clean(&PCG(wants));
+	php_pcov_clean(&PCG(ignores));
+}
+
 static zend_always_inline zend_bool php_pcov_wants(zend_string *filename) { /* {{{ */
 	if (!PCG(directory)) {
-		return 1;
+		return php_pcov_filter_admits(filename);
 	}
 
 	if (ZSTR_LEN(filename) < ZSTR_LEN(PCG(directory))) {
@@ -166,6 +733,11 @@ static zend_always_inline zend_bool php_pcov_wants(zend_string *filename) { /* {
 	}
 
 	if (zend_hash_exists(&PCG(ignores), filename)) {
+		return 0;
+	}
+
+	if (!php_pcov_filter_admits(filename)) {
+		zend_hash_add_empty_element(&PCG(ignores), filename);
 		return 0;
 	}
 
@@ -297,19 +869,28 @@ static zend_always_inline int php_pcov_has(zend_string *filename, uint32_t linen
 
 static zend_always_inline int php_pcov_trace(zend_execute_data *execute_data) { /* {{{ */
     if (PCG(enabled)) {
-		if (php_pcov_wants(EX(func)->op_array.filename) &&
-			!php_pcov_ignored_opcode(EX(opline)->opcode) &&
-			!php_pcov_has(EX(func)->op_array.filename, EX(opline)->lineno)) {
+		zend_op_array *op_array = &EX(func)->op_array;
 
-			php_coverage_t *coverage = php_pcov_create(execute_data);
-
-			if (!PCG(start)) {
-				PCG(start) = coverage;
-			} else {
-				*(PCG(next)) = coverage;
+		if (php_pcov_wants(op_array->filename)) {
+			/* Branch mode: record branch-start entry + per-invocation path
+			 * sequence for this frame. */
+			if (PCG(mode) == PCOV_MODE_BRANCH && op_array->type == ZEND_USER_FUNCTION) {
+				php_pcov_path_trace(execute_data, op_array);
 			}
 
-			PCG(next) = &coverage->next;
+			if (!php_pcov_ignored_opcode(EX(opline)->opcode) &&
+				!php_pcov_has(op_array->filename, EX(opline)->lineno)) {
+
+				php_coverage_t *coverage = php_pcov_create(execute_data);
+
+				if (!PCG(start)) {
+					PCG(start) = coverage;
+				} else {
+					*(PCG(next)) = coverage;
+				}
+
+				PCG(next) = &coverage->next;
+			}
 		}
 	}
 
@@ -386,6 +967,11 @@ PHP_MINIT_FUNCTION(pcov)
 	REGISTER_NS_STRING_CONSTANT("pcov", "version",     PHP_PCOV_VERSION,    CONST_CS|CONST_PERSISTENT);
 
 	REGISTER_INI_ENTRIES();
+
+	/* Route (c): opt-in xdebug-compatible surface so unmodified
+	 * php-code-coverage / PHPUnit can drive pcov for --path-coverage.
+	 * No-op unless pcov.mode=branch and the real Xdebug is absent. */
+	php_pcov_xdebug_compat_minit(INIT_FUNC_ARGS_PASSTHRU);
 
 	if (php_pcov_api_enabled()) {
 		zend_execute_ex_function   = zend_execute_ex;
@@ -487,6 +1073,12 @@ PHP_RINIT_FUNCTION(pcov)
 	zend_hash_init(&PCG(wants),      INI_INT("pcov.initial.files"), NULL, NULL, 0);
 	zend_hash_init(&PCG(discovered), INI_INT("pcov.initial.files"), NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&PCG(covered),    INI_INT("pcov.initial.files"), NULL, php_pcov_covered_dtor, 0);
+	zend_hash_init(&PCG(reached),    INI_INT("pcov.initial.files"), NULL, php_pcov_reached_dtor, 0);
+
+	PCG(mode) = php_pcov_resolve_mode();
+	PCG(frames) = NULL;
+	PCG(filter_mode) = PCOV_FILTER_MODE_NONE;
+	PCG(filter_paths_init) = 0;
 
 	php_pcov_setup_directory(INI_STR("pcov.directory"));
 	php_pcov_setup_exclude(INI_STR("pcov.exclude"));
@@ -520,8 +1112,16 @@ PHP_RSHUTDOWN_FUNCTION(pcov)
 	zend_hash_destroy(&PCG(ignores));
 	zend_hash_destroy(&PCG(wants));
 	zend_hash_destroy(&PCG(discovered));
+	php_pcov_frames_dtor();
+
 	zend_hash_destroy(&PCG(waiting));
 	zend_hash_destroy(&PCG(covered));
+	zend_hash_destroy(&PCG(reached));
+
+	if (PCG(filter_paths_init)) {
+		zend_hash_destroy(&PCG(filter_paths));
+		PCG(filter_paths_init) = 0;
+	}
 
 	zend_arena_destroy(PCG(mem));
 
@@ -598,6 +1198,28 @@ static zend_always_inline void php_pcov_report(php_coverage_t *coverage, zval *f
 	} while ((coverage = coverage->next));
 } /* }}} */
 
+/* Branch-mode line report: same as php_pcov_report but the per-file line map
+ * lives under return_value[file]['lines']. */
+static zend_always_inline void php_pcov_report_branch(php_coverage_t *coverage, zval *filter) { /* {{{ */
+	zval *file_info;
+	zval *lines;
+	zval *hit;
+
+	if (!coverage) {
+		return;
+	}
+
+	do {
+		if ((file_info = zend_hash_find(Z_ARRVAL_P(filter), coverage->file)) &&
+		    Z_TYPE_P(file_info) == IS_ARRAY &&
+		    (lines = zend_hash_str_find(Z_ARRVAL_P(file_info), "lines", sizeof("lines") - 1))) {
+			if ((hit = zend_hash_index_find(Z_ARRVAL_P(lines), coverage->line))) {
+				Z_LVAL_P(hit) = PHP_PCOV_COVERED;
+			}
+		}
+	} while ((coverage = coverage->next));
+} /* }}} */
+
 static void php_pcov_discover_code(zend_arena **arena, zend_op_array *ops, zval *return_value) { /* {{{ */
 	zend_cfg cfg;
 	zend_basic_block *block;
@@ -664,8 +1286,16 @@ static void php_pcov_discover_code(zend_arena **arena, zend_op_array *ops, zval 
 static void php_pcov_discover_file(zend_string *file, zval *return_value) { /* {{{ */
 	zval discovered;
 	zend_op_array *ops;
-	zval *cache = zend_hash_find(&PCG(discovered), file);
+	zval *cache;
 	zend_arena *mem;
+
+	/* Honor an xdebug_set_filter() path filter even for files already admitted
+	 * into PCG(files) before the filter was set. */
+	if (!php_pcov_filter_admits(file)) {
+		return;
+	}
+
+	cache = zend_hash_find(&PCG(discovered), file);
 
 	if (cache) {
 		zval uncached;
@@ -745,35 +1375,228 @@ static zend_always_inline void php_pcov_clean(HashTable *table) { /* {{{ */
 	}
 } /* }}} */
 
+/* Build branch+path info for one op_array and add it (keyed by its canonical
+ * function name) to the `functions` array. Recurses into dynamic func defs. */
+static void php_pcov_discover_functions_branch(zend_op_array *ops, zval *functions) { /* {{{ */
+	php_pcov_reached_t *cache;
+	pcov_branch_info *info;
+	char key[1024];
+	zval z_function;
+
+	if (ops->fn_flags & ZEND_ACC_ABSTRACT) {
+		return;
+	}
+
+	/* Get-or-build the cached analysis. php_pcov_reached_get() stores the CFG
+	 * (with empty hit sets for never-executed functions) in PCG(reached), so a
+	 * function is analyzed once per request even though php_pcov_discover_file_branch()
+	 * runs on every collect() and walks the class/function tables each time.
+	 * For a covered function the same entry already carries reached/path/edges. */
+	cache = php_pcov_reached_get(ops);
+	if (!cache || !cache->info) {
+		return;
+	}
+	info = cache->info;
+
+	pcov_branch_function_key(key, sizeof(key), ops);
+
+	array_init(&z_function);
+	pcov_branch_info_to_zval_ex(
+		&z_function, info,
+		cache->reached, cache->reached_bits,
+		cache->path_hits, cache->path_hits_bits,
+		cache->edges, cache->edges_bits);
+
+	/* Later definitions of the same key (e.g. re-included files) overwrite;
+	 * matches how xdebug's hash-keyed storage behaves. */
+	add_assoc_zval_ex(functions, key, strlen(key), &z_function);
+
+#if PHP_VERSION_ID >= 80100
+	{
+		uint32_t def;
+		for (def = 0; def < ops->num_dynamic_func_defs; def++) {
+			php_pcov_discover_functions_branch(ops->dynamic_func_defs[def], functions);
+		}
+	}
+#endif
+} /* }}} */
+
+/* Branch-mode analogue of php_pcov_discover_file: emit { lines, functions }
+ * for one file. `lines` reuses the existing line discovery + report. */
+static void php_pcov_discover_file_branch(zend_string *file, zval *return_value, php_coverage_t *line_hits) { /* {{{ */
+	zend_op_array *ops;
+	zval file_info, lines, functions;
+
+	/* Honor an xdebug_set_filter() path filter (see php_pcov_discover_file). */
+	if (!php_pcov_filter_admits(file)) {
+		return;
+	}
+
+	if (!(ops = zend_hash_find_ptr(&PCG(files), file))) {
+		return;
+	}
+
+	array_init(&file_info);
+
+	/* lines: reuse the proven line-discovery path into a temporary array,
+	 * then flip hit lines via the existing report walk. */
+	array_init(&lines);
+	{
+		zval tmp;
+		zval *entry;
+		zend_ulong lineno;
+		/* discover executable lines for this file into `lines` */
+		array_init(&tmp);
+		php_pcov_discover_file(file, &tmp);
+		if ((entry = zend_hash_find(Z_ARRVAL(tmp), file))) {
+			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(entry), lineno, entry) {
+				add_index_long(&lines, lineno, Z_LVAL_P(entry));
+			} ZEND_HASH_FOREACH_END();
+		}
+		zval_ptr_dtor(&tmp);
+	}
+
+	/* functions: main op_array + all user functions/methods for this file. */
+	array_init(&functions);
+
+	php_pcov_discover_functions_branch(ops, &functions);
+
+	{
+		zend_class_entry *ce;
+		zend_op_array    *function;
+		ZEND_HASH_FOREACH_PTR(EG(class_table), ce) {
+			if (ce->type != ZEND_USER_CLASS) {
+				continue;
+			}
+			ZEND_HASH_FOREACH_PTR(&ce->function_table, function) {
+				if (function->type == ZEND_USER_FUNCTION &&
+				    function->filename &&
+				    zend_string_equals(file, function->filename)) {
+					php_pcov_discover_functions_branch(function, &functions);
+				}
+			} ZEND_HASH_FOREACH_END();
+#if PHP_VERSION_ID >= 80400
+			if (ce->num_hooked_props > 0) {
+				zend_property_info *prop;
+				ZEND_HASH_MAP_FOREACH_PTR(&ce->properties_info, prop) {
+					if (prop->hooks) {
+						uint32_t hi;
+						for (hi = 0; hi < ZEND_PROPERTY_HOOK_COUNT; hi++) {
+							if (prop->hooks[hi]) {
+								function = &prop->hooks[hi]->op_array;
+								if (function->type == ZEND_USER_FUNCTION &&
+									function->filename &&
+									zend_string_equals(file, function->filename)) {
+									php_pcov_discover_functions_branch(function, &functions);
+								}
+							}
+						}
+					}
+				} ZEND_HASH_FOREACH_END();
+			}
+#endif
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	{
+		zend_op_array *function;
+		ZEND_HASH_FOREACH_PTR(EG(function_table), function) {
+			if (function->type == ZEND_USER_FUNCTION &&
+			    function->filename &&
+			    zend_string_equals(file, function->filename)) {
+				php_pcov_discover_functions_branch(function, &functions);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	add_assoc_zval_ex(&file_info, "lines",     sizeof("lines") - 1,     &lines);
+	add_assoc_zval_ex(&file_info, "functions", sizeof("functions") - 1, &functions);
+
+	zend_hash_update(Z_ARRVAL_P(return_value), file, &file_info);
+
+	(void) line_hits;
+} /* }}} */
+
 /* {{{ array \pcov\collect(int $type = \pcov\all, array $filter = []); */
-PHP_NAMED_FUNCTION(php_pcov_collect)
+static void php_pcov_collect_common(zval *return_value, zend_long type, zval *filter)
 {
-	zend_long type = PCOV_FILTER_ALL;
-	zval      *filter = NULL;
-
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|la", &type, &filter) != SUCCESS) {
-		return;
-	}
-
-	PHP_PCOV_API_ENABLED_GUARD();
-
-	if (PCOV_FILTER_ALL != type &&
-	    PCOV_FILTER_INCLUDE != type &&
-	    PCOV_FILTER_EXCLUDE != type) {
-		zend_throw_error(zend_ce_type_error,
-			"type must be "
-				"\\pcov\\inclusive, "
-				"\\pcov\\exclusive, or \\pcov\\all");
-		return;
-	}
+	zval empty_filter;
 
 	array_init(return_value);
 
-	if (PCG(last) == PCG(next)) {
-		return;
+	/* Line mode may short-circuit when no new line was hit since the last
+	 * collect(). Branch mode must NOT: branch/path hit state (and enumerated
+	 * paths from newly returned frames) can change without a new line hit, and
+	 * the xdebug-compat API delegates here — a second xdebug_get_code_coverage()
+	 * must still return the accumulated data rather than an empty array. */
+	if (PCG(mode) != PCOV_MODE_BRANCH) {
+		if (PCG(last) == PCG(next)) {
+			return;
+		}
+		PCG(last) = PCG(next);
+	} else {
+		PCG(last) = PCG(next);
 	}
 
-	PCG(last) = PCG(next);
+	/* Normalize a missing filter (e.g. \pcov\collect($type) with no array, or
+	 * the xdebug-compat surface) to an empty array so the INCLUDE/EXCLUDE paths
+	 * never dereference NULL via Z_ARRVAL_P(filter). Freed before returning. */
+	if (filter == NULL || Z_TYPE_P(filter) != IS_ARRAY) {
+		array_init(&empty_filter);
+		filter = &empty_filter;
+	} else {
+		ZVAL_UNDEF(&empty_filter);
+	}
+
+	if (PCG(mode) == PCOV_MODE_BRANCH) {
+		/* Finalize only frames whose functions have already returned; leaving
+		 * still-active frames intact so a collect() taken mid-execution does
+		 * not split a live function's path into unmatchable prefix/suffix. */
+		php_pcov_frames_finalize_returned();
+
+		switch (type) {
+			case PCOV_FILTER_INCLUDE: {
+				zval *filtered;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(filter), filtered) {
+					if (Z_TYPE_P(filtered) != IS_STRING) {
+						continue;
+					}
+					php_pcov_discover_file_branch(Z_STR_P(filtered), return_value, PCG(start));
+				} ZEND_HASH_FOREACH_END();
+			} break;
+
+			case PCOV_FILTER_EXCLUDE: {
+				zend_string *name;
+				zval *filtered;
+				ZEND_HASH_FOREACH_STR_KEY(&PCG(files), name) {
+					ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(filter), filtered) {
+						if (Z_TYPE_P(filtered) != IS_STRING) {
+							continue;
+						}
+						if (zend_string_equals(name, Z_STR_P(filtered))) {
+							goto _php_pcov_collect_exclude_branch;
+						}
+					} ZEND_HASH_FOREACH_END();
+					php_pcov_discover_file_branch(name, return_value, PCG(start));
+				_php_pcov_collect_exclude_branch:
+					continue;
+				} ZEND_HASH_FOREACH_END();
+			} break;
+
+			case PCOV_FILTER_ALL: {
+				zend_string *name;
+				ZEND_HASH_FOREACH_STR_KEY(&PCG(files), name) {
+					php_pcov_discover_file_branch(name, return_value, PCG(start));
+				} ZEND_HASH_FOREACH_END();
+			} break;
+		}
+
+		php_pcov_report_branch(PCG(start), return_value);
+		if (Z_TYPE(empty_filter) == IS_ARRAY) {
+			zval_ptr_dtor(&empty_filter);
+		}
+		return;
+	}
 
 	switch(type) {
 		case PCOV_FILTER_INCLUDE: {
@@ -816,6 +1639,35 @@ PHP_NAMED_FUNCTION(php_pcov_collect)
 	}
 
 	php_pcov_report(PCG(start), return_value);
+
+	if (Z_TYPE(empty_filter) == IS_ARRAY) {
+		zval_ptr_dtor(&empty_filter);
+	}
+} /* }}} */
+
+/* {{{ array \pcov\collect(int $type = \pcov\all, array $filter = []); */
+PHP_NAMED_FUNCTION(php_pcov_collect)
+{
+	zend_long type = PCOV_FILTER_ALL;
+	zval      *filter = NULL;
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "|la", &type, &filter) != SUCCESS) {
+		return;
+	}
+
+	PHP_PCOV_API_ENABLED_GUARD();
+
+	if (PCOV_FILTER_ALL != type &&
+	    PCOV_FILTER_INCLUDE != type &&
+	    PCOV_FILTER_EXCLUDE != type) {
+		zend_throw_error(zend_ce_type_error,
+			"type must be "
+				"\\pcov\\inclusive, "
+				"\\pcov\\exclusive, or \\pcov\\all");
+		return;
+	}
+
+	php_pcov_collect_common(return_value, type, filter);
 } /* }}} */
 
 /* {{{ void \pcov\start(void) */
@@ -840,6 +1692,12 @@ PHP_NAMED_FUNCTION(php_pcov_stop)
 	PHP_PCOV_API_ENABLED_GUARD();
 
 	PCG(enabled) = 0;
+
+	/* Finalize frames whose functions have already returned so their
+	 * per-invocation path sequences are recorded at stop time. */
+	if (PCG(mode) == PCOV_MODE_BRANCH) {
+		php_pcov_frames_finalize_returned();
+	}
 } /* }}} */
 
 /* {{{ void \pcov\clear(bool $files = 0) */
@@ -853,23 +1711,7 @@ PHP_NAMED_FUNCTION(php_pcov_clear)
 
 	PHP_PCOV_API_ENABLED_GUARD();
 
-	if (files) {
-		php_pcov_clean(&PCG(files));
-		php_pcov_clean(&PCG(discovered));
-	}
-
-	zend_arena_destroy(PCG(mem));
-
-	PCG(mem) =
-		zend_arena_create(
-			INI_INT("pcov.initial.memory"));
-
-	PCG(start) = NULL;
-	PCG(last) = NULL;
-	PCG(next) = NULL;
-
-	php_pcov_clean(&PCG(waiting));
-	php_pcov_clean(&PCG(covered));
+	php_pcov_clear_internal(files);
 } /* }}} */
 
 /* {{{ array \pcov\waiting(void) */

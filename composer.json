@@ -1,13 +1,37 @@
 {
-    "name": "pecl/pcov",
+    "name": "juslintek/pcov-enhanced",
     "type": "php-ext",
     "license": "PHP-3.01",
-    "description": "PCOV - CodeCoverage compatible driver for PHP",
+    "description": "pcov-enhanced - an alternative pcov build that adds branch and path coverage (like Xdebug, but far faster). Drop-in replacement for pcov: line coverage is unchanged; pcov.mode=branch adds branch/path coverage consumable through phpunit --path-coverage.",
+    "keywords": ["code coverage", "coverage", "pcov", "branch coverage", "path coverage", "phpunit", "xdebug", "testing"],
+    "homepage": "https://github.com/juslintek/pcov-enhanced",
+    "authors": [
+        {
+            "name": "Joe Watkins",
+            "role": "Original pcov author"
+        },
+        {
+            "name": "Linas Jusys",
+            "email": "jusys.linas@gmail.com",
+            "role": "Branch & path coverage"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/juslintek/pcov-enhanced/issues",
+        "source": "https://github.com/juslintek/pcov-enhanced"
+    },
     "require": {
         "php": ">= 7.1.0"
     },
+    "conflict": {
+        "pecl/pcov": "*"
+    },
+    "replace": {
+        "pecl/pcov": "*"
+    },
     "php-ext": {
         "extension-name": "pcov",
+        "priority": 80,
         "configure-options": [
             {
                 "name": "enable-pcov",
