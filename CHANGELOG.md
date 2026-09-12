@@ -5,6 +5,25 @@ This project builds and loads as the `pcov` extension and tracks upstream
 [krakjoe/pcov](https://github.com/krakjoe/pcov); entries below describe what
 this distribution adds on top of it.
 
+## [Unreleased]
+
+### Distribution
+- **PIE support documented.** Added a PIE (PHP Installer for Extensions,
+  `php/pie`) install route (`pie install juslintek/pcov-enhanced`) to
+  `docs/04-distribution.md` and `INSTALL.md`. PIE reuses the existing
+  `composer.json` `php-ext` metadata and builds from source; `config.m4` is at
+  the repo root so no `php-ext.build-path` override is needed.
+- **package.xml date handling.** Set `<date>` to the current UTC date and
+  documented that it must be bumped per release (removes the PECL "Release Date
+  is not today" validator warning at package time). Added an XML comment noting
+  the "providesextension name differs from package name" warning is intentional
+  (we publish as `pcov_enhanced` while providing the drop-in `pcov` extension).
+- **Repo-rename clarified.** Documented that the GitHub repository stays named
+  `pcov-enhanced` and that package identity does not depend on the repo name
+  (it comes from `package.xml` / `composer.json`); a manual rename by a
+  maintainer is optional.
+- Added a `support.docs` link to `composer.json`.
+
 ## [1.1.0] - 2026-09-10
 
 ### Added

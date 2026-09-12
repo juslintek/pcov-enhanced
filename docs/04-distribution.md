@@ -9,6 +9,15 @@ coverage (`pcov.mode=branch`) that is consumable through
 Because it *is* the `pcov` extension internally, **only one of `pcov` and
 `pcov-enhanced` may be installed at a time.** Installing this replaces pcov.
 
+> **On the GitHub repository name.** The repository stays named
+> `pcov-enhanced`. Package identity does **not** depend on the repo name: it
+> comes from `package.xml` (`pcov_enhanced` on PECL) and `composer.json`
+> (`juslintek/pcov-enhanced` on Packagist / PIE), while the compiled extension
+> is always `pcov`. Renaming the GitHub repo is optional and can only be done
+> manually by a maintainer in GitHub settings (the release automation token
+> cannot rename repositories); none of the packaging or install routes above
+> require it.
+
 ---
 
 ## 1. Build from source
@@ -69,7 +78,31 @@ To publish on Packagist: submit the repository URL at
 picks them up. The `extension-name` stays `pcov` so PHP tooling that looks for
 the `pcov` extension keeps working.
 
-## 4. Prebuilt binaries via CI (recommended for consumers)
+## 4. PIE (PHP Installer for Extensions)
+
+[PIE](https://github.com/php/pie) is the modern successor to `pecl install`
+for PHP 8.3+. It consumes the **same** `composer.json` `php-ext` metadata
+(`type: php-ext`, `php-ext.extension-name`, `php-ext.configure-options`,
+`php-ext.priority`), resolves the package from Packagist/GitHub, and **builds
+from source**, installing it as the `pcov` extension. Because it reuses the
+Composer metadata, no PIE-specific manifest is required.
+
+```sh
+pie install juslintek/pcov-enhanced
+```
+
+Notes:
+- PIE downloads the package from Packagist/GitHub and compiles it, so it
+  **requires network access** and a working build toolchain (`phpize`,
+  compiler). It cannot run in a fully offline environment.
+- `config.m4` lives at the **repository root**, which is PIE's default build
+  path, so **no `php-ext.build-path` override is needed** in `composer.json`.
+- The `extension-name` stays `pcov`, and `replace`/`conflict` on `pecl/pcov`
+  ensure PIE/Composer treat this build as the pcov provider (install one at a
+  time). Enable it in php.ini exactly as in the source-build route above
+  (`extension=pcov.so`).
+
+## 5. Prebuilt binaries via CI (recommended for consumers)
 
 The GitHub Actions workflow already builds the extension across PHP 8.2–8.4. To
 ship binaries, extend it to `actions/upload-artifact` / attach to a GitHub
@@ -78,7 +111,7 @@ DLLs via the existing AppVeyor pipeline. Consumers can then drop the `.so`/`.dll
 into their extension dir without a toolchain. `setup-php` users can point at the
 release asset.
 
-## 5. Distro packages (downstream)
+## 6. Distro packages (downstream)
 
 Upstream pcov ships in Fedora (`php-pecl-pcov`), Debian/Ubuntu (Sury/ondrej
 `php-pcov`), etc. Those are maintained by distro packagers from the official

@@ -18,7 +18,8 @@
     ],
     "support": {
         "issues": "https://github.com/juslintek/pcov-enhanced/issues",
-        "source": "https://github.com/juslintek/pcov-enhanced"
+        "source": "https://github.com/juslintek/pcov-enhanced",
+        "docs": "https://github.com/juslintek/pcov-enhanced/blob/main/docs/04-distribution.md"
     },
     "require": {
         "php": ">= 7.1.0"
