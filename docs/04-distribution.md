@@ -120,6 +120,51 @@ PECL release. For this alternative build the realistic paths are:
 - upstreaming the feature into `krakjoe/pcov` (see PR) so it reaches those
   channels through the normal pcov release — the preferred long-term route.
 
+## 7. Docker & Kubernetes
+
+Ready-to-use container artifacts live in [`docker/`](../docker/) and
+[`k8s/`](../k8s/). They build and ship the extension as the standard, drop-in
+`pcov` extension on top of the official `php:*` images, so every tool that
+expects `pcov` (PHPUnit `--coverage-*`, Infection, …) works unchanged, and
+`pcov.mode=branch` additionally unlocks `phpunit --path-coverage` through the
+Xdebug-compat shim.
+
+- **[`docker/Dockerfile`](../docker/Dockerfile)** — multi-stage build,
+  parameterized by `ARG PHP_VERSION` (default 8.4), that compiles pcov-enhanced
+  inside a `php:${PHP_VERSION}-cli` image via `phpize && ./configure
+  --enable-pcov && make && make install` and enables it with a conf.d snippet
+  (`extension=pcov.so`, `pcov.enabled=1`).
+- **[`docker/docker-bake.hcl`](../docker/docker-bake.hcl)** — builds the PHP
+  8.2 / 8.3 / 8.4 image matrix with a single `docker buildx bake`.
+- **[`docker/compose.yaml`](../docker/compose.yaml)** — dev example that mounts
+  a project and runs coverage.
+- **[`docker/README.md`](../docker/README.md)** — build/run/publish commands and
+  CI-base-image recipes (GitHub Actions + GitLab CI).
+
+Two container delivery models are documented under [`k8s/`](../k8s/):
+
+1. **Image-based (recommended)** —
+   [`k8s/prebuilt-image-example.yaml`](../k8s/prebuilt-image-example.yaml) runs a
+   pcov-enhanced image directly. The `.so` is compiled inside that image, so it
+   always matches the image's PHP API version; there is nothing to inject.
+2. **Init-container injection** —
+   [`k8s/initcontainer-example.yaml`](../k8s/initcontainer-example.yaml) keeps an
+   existing PHP image unchanged and uses an `initContainer` (built from the
+   matching pcov-enhanced image) to copy `pcov.so` + a pcov `.ini` into a shared
+   `emptyDir` mounted at the app container's extension/conf.d dir.
+
+> **PHP API version matching.** A compiled `.so` only loads into a PHP binary
+> whose PHP API version matches the build. The image-based model is safe by
+> construction; the init-container model requires the source and destination
+> images to share the same PHP minor version (and ZTS/NTS + debug build). See
+> [`k8s/README.md`](../k8s/README.md) for details.
+
+> **Offline note.** `docker build` / `docker buildx bake` pull the official
+> `php:*` base images and therefore require network access; they are the
+> networked steps a maintainer or CI runs (exact commands are in
+> [`docker/README.md`](../docker/README.md)). The manifests and Dockerfile are
+> validated structurally (YAML parse, `bake --print`) in this repo's tooling.
+
 ## Coexistence & safety
 
 - **Real Xdebug present:** the xdebug-compat surface does not register and

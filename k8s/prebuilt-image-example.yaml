@@ -1,0 +1,86 @@
+# k8s/prebuilt-image-example.yaml
+#
+# Pattern: "use a pcov-enhanced-based image directly".
+#
+# The simplest model: run a pcov-enhanced image (built from docker/Dockerfile)
+# as the app/CI container. The `pcov` extension is already compiled in and
+# matches the image's own PHP API version, so there is nothing to inject and no
+# version-matching problem to worry about — the .so was built inside this exact
+# image. Prefer this pattern unless you must keep an existing app image
+# unchanged (in which case see initcontainer-example.yaml).
+#
+# Set pcov.mode via an env var / -d flag or bake it into the conf.d snippet in
+# the Dockerfile. Default mode is "line" (byte-for-byte upstream pcov);
+# "branch" enables path coverage through the Xdebug-compat shim.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pcov-enhanced-app
+  labels:
+    app: pcov-enhanced-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pcov-enhanced-app
+  template:
+    metadata:
+      labels:
+        app: pcov-enhanced-app
+    spec:
+      containers:
+        - name: app
+          # A pcov-enhanced image tagged for the PHP version you want. The
+          # extension is compiled in and loads as the standard `pcov` extension.
+          image: ghcr.io/juslintek/pcov-enhanced:8.4
+          # Overlay your application on top of the image however you normally
+          # do (COPY in a derived Dockerfile, a volume, etc.). This example
+          # just keeps the pod alive and proves pcov is loaded.
+          command:
+            - sh
+            - -c
+            - |
+              php -m | grep -qx pcov && echo "pcov loaded" && sleep infinity
+          env:
+            # Opt in to branch/path coverage without editing php.ini.
+            - name: PCOV_MODE
+              value: "branch"
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "php -m | grep -qx pcov"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+---
+# One-shot coverage run as a Job (e.g. in a CI cluster): mount your project and
+# run PHPUnit with path coverage. The image already provides `pcov`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pcov-enhanced-coverage
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: coverage
+          image: ghcr.io/juslintek/pcov-enhanced:8.4
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              php -m | grep -qx pcov
+              # Replace with your real coverage command, e.g.:
+              #   php -d pcov.mode=branch vendor/bin/phpunit --path-coverage --coverage-text
+              php -d pcov.mode=branch -r 'var_dump(function_exists("xdebug_get_code_coverage"));'
+          volumeMounts:
+            - name: project
+              mountPath: /app
+      volumes:
+        # Replace with however your CI provides the checked-out project
+        # (a PVC, a git-sync sidecar, etc.). emptyDir shown for a self-contained
+        # smoke test.
+        - name: project
+          emptyDir: {}
