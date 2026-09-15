@@ -109,9 +109,11 @@ per-PHP-version `modules/pcov.so` to the release as a named asset that encodes
 the extension version, PHP version, OS, architecture and thread-safety, e.g.:
 
 ```
-pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so
-pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so.sha256
+pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-gnu-nts.so
+pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-gnu-nts.so.sha256
 ```
+
+The `-gnu` token records the libc/ABI baseline (see the OS/libc note below).
 
 A combined `SHA256SUMS.txt` covering the PECL tarball and every `.so` is also
 attached so consumers can verify downloads. On GitHub these are produced by the
@@ -132,6 +134,15 @@ additionally be shipped via the AppVeyor pipeline).
 > **PHP API version matching.** A prebuilt `.so` only loads into a PHP binary
 > with the same PHP API version (and matching ZTS/NTS + debug flag). Always
 > download the asset whose `phpX.Y` and `nts`/`zts` fields match your runtime.
+
+> **OS / libc baseline (`-gnu`).** The prebuilt `.so` files are built on
+> Ubuntu (glibc), so the asset name carries a `-gnu` token
+> (`...-linux-<arch>-gnu-<ts>.so`). They load on **glibc**-based PHP images
+> (Debian `php:*-cli`, `php:*-fpm`, etc.) but **NOT** on **musl/Alpine**
+> `php:*-alpine` images: a glibc `.so` cannot load against musl. On musl/Alpine
+> build from source via PECL/PIE (sections 2 and 4) or use the container
+> image-based model (section 7). GitHub and GitLab produce byte-for-byte
+> identical asset names.
 
 ### `setup-php` consumption recipe (no toolchain)
 
@@ -159,7 +170,8 @@ jobs:
           php_minor="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
           arch="$(uname -m)"
           ts="$(php -r 'echo PHP_ZTS ? "zts" : "nts";')"
-          asset="pcov-pcov-enhanced-${VERSION}-php${php_minor}-linux-${arch}-${ts}.so"
+          # `-gnu` = glibc baseline (Ubuntu/Debian runners); not for musl/Alpine.
+          asset="pcov-pcov-enhanced-${VERSION}-php${php_minor}-linux-${arch}-gnu-${ts}.so"
           base="https://github.com/juslintek/pcov-enhanced/releases/download/v${VERSION}"
           curl -fSL -o pcov.so "${base}/${asset}"
           curl -fSL -o pcov.so.sha256 "${base}/${asset}.sha256"
@@ -182,7 +194,8 @@ test:
   script:
     - php_minor="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
     - arch="$(uname -m)"; ts="$(php -r 'echo PHP_ZTS ? "zts" : "nts";')"
-    - asset="pcov-pcov-enhanced-${VERSION}-php${php_minor}-linux-${arch}-${ts}.so"
+    # `-gnu` = glibc baseline (official php:* Debian images); not for Alpine.
+    - asset="pcov-pcov-enhanced-${VERSION}-php${php_minor}-linux-${arch}-gnu-${ts}.so"
     - base="https://gitlab.com/juslintek/pcov-enhanced/-/releases/v${VERSION}/downloads"
     - curl -fSL -o pcov.so "${base}/${asset}"
     - ext_dir="$(php -r 'echo ini_get("extension_dir");')"
@@ -229,15 +242,22 @@ git push origin vX.Y.Z          # the tag is what triggers the release jobs
 
 ### Step 3 — CI publishes automatically (no human action)
 
+> **Tag ↔ `package.xml` guard.** Release assets are versioned from
+> `package.xml`, not the tag. Both platforms validate that the pushed tag
+> (with any leading `v` stripped) equals `package.xml`'s `<version><release>`
+> and fail the pipeline **before** any asset is produced on mismatch: GitLab
+> via an early `verify:version` job (in the `verify` stage), GitHub via a guard
+> step in the tag-gated `package` and `prebuilt-binaries` jobs.
+
 - **GitHub Actions** (`.github/workflows/ci.yml`): on the `refs/tags/*` push,
   the `package` job attaches the PECL tarball `pcov_enhanced-X.Y.Z.tgz`, the
-  `prebuilt-binaries` job attaches one `pcov-pcov-enhanced-X.Y.Z-phpM.m-linux-<arch>-<ts>.so`
+  `prebuilt-binaries` job attaches one `pcov-pcov-enhanced-X.Y.Z-phpM.m-linux-<arch>-gnu-<ts>.so`
   (+ `.sha256`) per PHP version, and the `checksums` job attaches a combined
   `SHA256SUMS.txt`. `contents: write` is scoped to those release/packaging jobs
   only; every third-party action is SHA-pinned.
 - **GitLab CI** (`.gitlab-ci.yml`): the `package` stage produces the same set of
   deliverables as GitHub. A `prebuilt` job runs as a `parallel: matrix` over PHP
-  8.2/8.3/8.4 and builds one `pcov-pcov-enhanced-X.Y.Z-phpM.m-linux-<arch>-<ts>.so`
+  8.2/8.3/8.4 and builds one `pcov-pcov-enhanced-X.Y.Z-phpM.m-linux-<arch>-gnu-<ts>.so`
   per version; a `package` job (php:8.4) builds the PECL tarball; and a
   `checksums` job `needs` all of them and aggregates the tarball + all three
   `.so` files into one combined `SHA256SUMS.txt`. Each producer exports its own
@@ -339,8 +359,11 @@ Two container delivery models are documented under [`k8s/`](../k8s/):
 
 > **PHP API version matching.** A compiled `.so` only loads into a PHP binary
 > whose PHP API version matches the build. The image-based model is safe by
-> construction; the init-container model requires the source and destination
-> images to share the same PHP minor version (and ZTS/NTS + debug build). See
+> construction; the init-container model requires the source (pcov-enhanced) and
+> destination (app) images to share the same PHP minor version (and ZTS/NTS +
+> debug build) **and the same libc/ABI**: both glibc (Debian `php:*`) or both
+> musl (Alpine `php:*-alpine`). A glibc `pcov.so` copied into a musl image (or
+> vice-versa) will not load even when the PHP API version matches. See
 > [`k8s/README.md`](../k8s/README.md) for details.
 
 > **Offline note.** `docker build` / `docker buildx bake` pull the official

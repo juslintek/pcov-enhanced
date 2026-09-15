@@ -11,6 +11,7 @@
 # This cannot run in a fully offline environment.
 
 stages:
+  - verify
   - build
   - test
   - package
@@ -25,8 +26,33 @@ stages:
     PHPIZE_DEPS: "autoconf gcc make libc-dev pkg-config re2c"
 
 # ---------------------------------------------------------------------------
-# build: compile the extension across the PHP version matrix and cache the
-# built tree (modules/pcov.so) for the test/package stages.
+# verify:version: on tag pushes only, fail the pipeline EARLY (before any build
+# or release asset is produced) if the tag does not match package.xml's
+# <version><release>. Normalizes a leading "v" off the tag. The package /
+# prebuilt / release jobs all run after this stage, so a mismatched tag can
+# never publish assets.
+# ---------------------------------------------------------------------------
+verify:version:
+  stage: verify
+  image: php:8.4
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - version=$(php -r '$x=simplexml_load_file("package.xml"); echo (string)$x->version->release;')
+    - tag_version="${CI_COMMIT_TAG#v}"
+    - |
+      if [ "$version" != "$tag_version" ]; then
+        echo "package.xml version $version does not match tag $CI_COMMIT_TAG" >&2
+        exit 1
+      fi
+    - echo "package.xml version $version matches tag $CI_COMMIT_TAG"
+
+# ---------------------------------------------------------------------------
+# build: compile the extension across the PHP version matrix and store the
+# built modules/pcov.so under a PER-VERSION path (build/$PHP_VERSION/pcov.so)
+# for the test/package stages. The per-version path guarantees a test instance
+# can only ever load the .so built for its own PHP_VERSION, even if several
+# build artifacts are present together.
 # ---------------------------------------------------------------------------
 build:
   stage: build
@@ -40,10 +66,13 @@ build:
     - ./configure --enable-pcov --with-php-config="$(command -v php-config)"
     - make -j"$(nproc)"
     - php -d extension="$(pwd)/modules/pcov.so" -d pcov.enabled=1 -r 'exit(phpversion("pcov")?0:1);'
+    # Store the built .so under a PHP-version-specific path so a cross-version
+    # artifact can never be loaded by the wrong test instance.
+    - mkdir -p "build/$PHP_VERSION"
+    - cp modules/pcov.so "build/$PHP_VERSION/pcov.so"
   artifacts:
     paths:
-      - modules/pcov.so
-      - .libs/
+      - build/$PHP_VERSION/pcov.so
     expire_in: 1 day
 
 # ---------------------------------------------------------------------------
@@ -67,7 +96,10 @@ test:line:
   variables:
     NO_INTERACTION: "1"
     REPORT_EXIT_STATUS: "1"
-    TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
+    # Load the .so from THIS instance's own PHP_VERSION path, so even though all
+    # three build artifacts are imported, only the matching-version binary is
+    # ever used (no cross-version clobbering).
+    TEST_PHP_ARGS: "-d extension=$(pwd)/build/$PHP_VERSION/pcov.so -d pcov.enabled=1 -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
   script:
     - php run-tests.php tests/
 
@@ -87,7 +119,8 @@ test:branch:
   variables:
     NO_INTERACTION: "1"
     REPORT_EXIT_STATUS: "1"
-    TEST_PHP_ARGS: "-d extension=$(pwd)/modules/pcov.so -d pcov.enabled=1 -d pcov.mode=branch -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
+    # Load the .so from THIS instance's own PHP_VERSION path (see test:line).
+    TEST_PHP_ARGS: "-d extension=$(pwd)/build/$PHP_VERSION/pcov.so -d pcov.enabled=1 -d pcov.mode=branch -d opcache.jit=disable -d opcache.jit_buffer_size=0 -q --show-diff"
   script:
     - php run-tests.php tests/
 
@@ -125,7 +158,10 @@ prebuilt:
     - PHP_MINOR=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
     - ARCH=$(uname -m)
     - TS=$(php -r 'echo PHP_ZTS?"zts":"nts";')
-    - SO_NAME="pcov-pcov-enhanced-${VERSION}-php${PHP_MINOR}-linux-${ARCH}-${TS}.so"
+    # The `-gnu` token records the libc/ABI baseline: these are built on a
+    # Debian/glibc php:* image and load only on glibc-based PHP runtimes, NOT on
+    # musl/Alpine. Keep identical to GitHub's naming (.github/workflows/ci.yml).
+    - SO_NAME="pcov-pcov-enhanced-${VERSION}-php${PHP_MINOR}-linux-${ARCH}-gnu-${TS}.so"
     - cp modules/pcov.so "$SO_NAME"
     - sha256sum "$SO_NAME" > "${SO_NAME}.sha256"
     # Emit VERSION-SPECIFIC dotenv keys so the three matrix instances do not
@@ -143,7 +179,9 @@ prebuilt:
       - pcov-pcov-enhanced-*.so.sha256
     reports:
       dotenv: prebuilt.env
-    expire_in: 30 days
+    # Release links point at these raw job artifacts, so they must not expire
+    # or the release download links would 404.
+    expire_in: never
 
 # ---------------------------------------------------------------------------
 # package: validate + build the PECL tarball on php:8.4 and verify it builds
@@ -185,7 +223,8 @@ package:
       - pcov_enhanced-*.tgz
     reports:
       dotenv: package.env
-    expire_in: 30 days
+    # Release links point at these raw job artifacts, so they must not expire.
+    expire_in: never
 
 # ---------------------------------------------------------------------------
 # checksums: aggregate the PECL tarball + all three prebuilt .so files into one
@@ -215,7 +254,8 @@ checksums:
       - SHA256SUMS.txt
     reports:
       dotenv: checksums.env
-    expire_in: 30 days
+    # Release links point at this raw job artifact, so it must not expire.
+    expire_in: never
 
 # ---------------------------------------------------------------------------
 # release: on tag pushes only, create a GitLab Release attaching the PECL
@@ -226,6 +266,10 @@ release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
+    # verify:version runs first (verify stage) and fails the pipeline on a
+    # tag/package.xml mismatch before any asset is produced; depend on it so
+    # the ordering is explicit here too.
+    - job: verify:version
     # `artifacts: true` imports each upstream dotenv report, so PACKAGE_JOB_ID /
     # TGZ_NAME (package), PREBUILT_JOB_ID_82.._84 + SO_NAME_82.._84 (prebuilt
     # matrix), and CHECKSUMS_JOB_ID (checksums) are all available here.

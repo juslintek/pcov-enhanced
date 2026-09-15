@@ -35,7 +35,8 @@ this distribution adds on top of it.
   Release via `release-cli`.
 - **Prebuilt-binary release assets.** On tag pushes, CI now attaches a
   per-PHP-version `modules/pcov.so` named to encode version + PHP version + OS +
-  arch + thread-safety (e.g. `pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-nts.so`)
+  arch + libc/ABI + thread-safety
+  (e.g. `pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-gnu-nts.so`)
   plus a `SHA256SUMS.txt`, so consumers (e.g. `setup-php`) can install without a
   toolchain. GitHub: new `prebuilt-binaries` + `checksums` jobs in
   `.github/workflows/ci.yml` (reusing the SHA-pinned `softprops/action-gh-release`,
@@ -57,6 +58,25 @@ this distribution adds on top of it.
   (it comes from `package.xml` / `composer.json`); a manual rename by a
   maintainer is optional.
 - Added a `support.docs` link to `composer.json`.
+- **Addressed automated review (Amazon Q + CodeRabbit) on the distribution
+  infrastructure.** k8s init-container example now mounts the shared `pcov-ext`
+  volume at the stable parent `extension_dir`
+  (`/usr/local/lib/php/extensions`) with the initContainers copying into an
+  api-versioned subdir, so it survives PHP API-version changes, and its seed
+  step no longer masks real copy failures. Added
+  `nodeSelector: { kubernetes.io/arch: amd64 }` to all three k8s pod specs
+  (the referenced images are amd64-only). The prebuilt-image example now applies
+  `PCOV_MODE` at runtime via `php -d "pcov.mode=..."` (the image ships it
+  commented out). GitLab CI now stores each build's `pcov.so` under a
+  per-version path so tests can never load a cross-version binary, guards the
+  release tag against `package.xml` via an early `verify:version` job, and keeps
+  release-linked artifacts (`prebuilt`/`package`/`checksums`) non-expiring
+  (`expire_in: never`). GitHub Actions mirrors the tag↔`package.xml` guard in
+  its `package` and `prebuilt-binaries` jobs. Prebuilt `.so` asset names now
+  encode the glibc ABI baseline as a `-gnu` token
+  (`...-linux-<arch>-gnu-<ts>.so`), identical across GitHub and GitLab, and the
+  docs document the glibc-vs-musl/Alpine limitation plus the init-container
+  libc/ABI matching requirement.
 
 ## [1.1.0] - 2026-09-10
 

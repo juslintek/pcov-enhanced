@@ -28,6 +28,11 @@ spec:
       labels:
         app: pcov-enhanced-app
     spec:
+      # The pcov-enhanced images are built linux/amd64 only (see
+      # docker/docker-bake.hcl), so pin scheduling to amd64 nodes. Remove or
+      # adjust this once multi-arch images are published.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
         - name: app
           # A pcov-enhanced image tagged for the PHP version you want. The
@@ -39,10 +44,19 @@ spec:
           command:
             - sh
             - -c
+            # PCOV_MODE only takes effect if it is passed to PHP explicitly with
+            # `-d pcov.mode=...` (or baked into an ACTIVE, uncommented conf.d
+            # directive): the image ships `;pcov.mode=branch` COMMENTED OUT, so
+            # env alone changes nothing. We forward it here (defaulting to
+            # "line") so the smoke test honours the configured mode.
             - |
-              php -m | grep -qx pcov && echo "pcov loaded" && sleep infinity
+              php -d "pcov.mode=${PCOV_MODE:-line}" -m | grep -qx pcov \
+                && echo "pcov loaded (mode=${PCOV_MODE:-line})" && sleep infinity
           env:
-            # Opt in to branch/path coverage without editing php.ini.
+            # Opt in to branch/path coverage without editing php.ini. NOTE: this
+            # only has an effect because the command above passes it via `-d`;
+            # the Dockerfile ships pcov.mode commented out, so PHP does not read
+            # this env var on its own.
             - name: PCOV_MODE
               value: "branch"
           readinessProbe:
@@ -62,6 +76,11 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # The pcov-enhanced images are built linux/amd64 only (see
+      # docker/docker-bake.hcl), so pin scheduling to amd64 nodes. Remove or
+      # adjust this once multi-arch images are published.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
         - name: coverage
           image: ghcr.io/juslintek/pcov-enhanced:8.4

@@ -20,9 +20,15 @@
 #
 # Both images below assume the official php extension_dir layout
 # (/usr/local/lib/php/extensions/no-debug-non-zts-<api>) and conf.d at
-# /usr/local/etc/php/conf.d. The initContainer resolves the real extension_dir
-# at runtime via `php -r 'echo ini_get("extension_dir");'` so it stays correct
-# across PHP patch releases.
+# /usr/local/etc/php/conf.d. The initContainers resolve the real extension_dir
+# at runtime via `php -r 'echo ini_get("extension_dir");'` so they stay correct
+# across PHP patch releases. Because the api-versioned leaf directory
+# (no-debug-non-zts-<api>) changes whenever the PHP API version changes, each
+# initContainer copies into a subdirectory of the shared volume that matches the
+# resolved extension_dir BASENAME, and the app container mounts the volume at
+# the PARENT dir (/usr/local/lib/php/extensions). Mounting the stable parent
+# keeps the manifest valid across PHP patch/minor API-version changes without
+# hardcoding the api-versioned leaf into the mountPath.
 #
 # ==================== extension_dir OVERLAY CAVEAT ==========================
 # The app container mounts the shared `pcov-ext` volume OVER its entire
@@ -55,6 +61,11 @@ spec:
       labels:
         app: app-with-pcov
     spec:
+      # The pcov-enhanced images referenced here are built linux/amd64 only
+      # (see docker/docker-bake.hcl), so pin scheduling to amd64 nodes.
+      # Remove or adjust this once multi-arch images are published.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       volumes:
         # Holds the copied pcov.so (populated by the initContainer).
         - name: pcov-ext
@@ -76,10 +87,20 @@ spec:
             - |
               set -eux
               EXT_DIR="$(php -r 'echo ini_get("extension_dir");')"
-              # Copy any pre-existing extensions from the app image (glob may be
-              # empty on a stock image — that is fine).
-              cp -a "$EXT_DIR"/. /pcov-ext/ 2>/dev/null || true
-              ls -l /pcov-ext/ || true
+              # Copy into a subdir matching the extension_dir basename so the
+              # app container can mount the shared volume at the STABLE parent
+              # (/usr/local/lib/php/extensions) rather than the api-versioned
+              # leaf. `install-pcov` writes pcov.so into the same subdir.
+              DEST="/pcov-ext/$(basename "$EXT_DIR")"
+              mkdir -p "$DEST"
+              # Copy any pre-existing extensions from the app image. A stock
+              # image can have an empty extension_dir, which is fine; guard on
+              # the dir existing and being non-empty so we stay resilient there
+              # WITHOUT masking real copy failures (permissions/storage).
+              if [ -d "$EXT_DIR" ] && [ -n "$(ls -A "$EXT_DIR" 2>/dev/null)" ]; then
+                cp -a "$EXT_DIR"/. "$DEST"/
+              fi
+              ls -l "$DEST"/ || true
           volumeMounts:
             - name: pcov-ext
               mountPath: /pcov-ext
@@ -97,7 +118,13 @@ spec:
               set -eux
               # Resolve the real extension_dir so patch-version changes are safe.
               EXT_DIR="$(php -r 'echo ini_get("extension_dir");')"
-              cp "$EXT_DIR/pcov.so" /pcov-ext/pcov.so
+              # Add pcov.so into the same api-versioned subdir the app container
+              # will resolve at runtime (the volume is mounted at the parent dir
+              # /usr/local/lib/php/extensions, so this recreates the expected
+              # .../extensions/<api-versioned>/pcov.so layout).
+              DEST="/pcov-ext/$(basename "$EXT_DIR")"
+              mkdir -p "$DEST"
+              cp "$EXT_DIR/pcov.so" "$DEST/pcov.so"
               # Ship an ini snippet the app container will load from conf.d.
               cat > /pcov-conf/docker-php-ext-pcov.ini <<'INI'
               ; pcov-enhanced injected via initContainer (loads as standard `pcov`)
@@ -118,14 +145,19 @@ spec:
           image: php:8.3-fpm
           command: ["php-fpm"]
           volumeMounts:
-            # Mount the shared volume over the image's extension_dir. It holds
-            # the app image's own extensions (seeded by `seed-extensions`) PLUS
-            # pcov.so (added by `install-pcov`), so nothing the app image
-            # shipped is hidden. Adjust the mountPath to match
-            # `php -i | grep extension_dir` in YOUR image if it differs (it is
-            # stable within a PHP minor version).
+            # Mount the shared volume at the PARENT extensions dir (not the
+            # api-versioned leaf). The initContainers populate a
+            # <api-versioned>/ subdir inside the volume that matches the
+            # extension_dir basename PHP resolves at runtime, so PHP finds
+            # .../extensions/<api-versioned>/pcov.so exactly where it expects.
+            # Mounting the parent is stable across PHP patch/minor API-version
+            # changes: no api-versioned path is hardcoded here, so a base-image
+            # PHP bump that changes the API number keeps working without editing
+            # this manifest. The volume holds the app image's own extensions
+            # (seeded by `seed-extensions`) PLUS pcov.so (added by
+            # `install-pcov`), so nothing the app image shipped is hidden.
             - name: pcov-ext
-              mountPath: /usr/local/lib/php/extensions/no-debug-non-zts-20230831
+              mountPath: /usr/local/lib/php/extensions
             # Mount only the pcov ini into conf.d via subPath so the base
             # image's other conf.d snippets are preserved (a full-directory
             # mount would hide them).
