@@ -5,6 +5,79 @@ This project builds and loads as the `pcov` extension and tracks upstream
 [krakjoe/pcov](https://github.com/krakjoe/pcov); entries below describe what
 this distribution adds on top of it.
 
+## [Unreleased]
+
+### Documentation
+- **Coverage-tooling compatibility matrix.** Added
+  `docs/05-tooling-compatibility.md` documenting how each coverage-consuming
+  tool works with this drop-in `pcov`/Xdebug-compat build: PHPUnit +
+  php-code-coverage (line via `PcovDriver`; branch/path via `--path-coverage`
+  through the shim), Infection, Paratest, Codeception, Behat, and the
+  Coveralls/Codecov/Scrutinizer uploaders (driver-agnostic Clover/Cobertura
+  consumers). States driver selection per tool, line + branch/path support,
+  caveats, and the real-Xdebug coexistence rule; cites the `Selector` logic from
+  `docs/01-contract.md` and the validated numbers from `docs/03-results.md`.
+- **Future native-API design.** Added `docs/06-future-native-api.md`, a
+  forward-looking design for the clean route (a): a php-code-coverage `Selector`
+  capability probe (`\pcov\capabilities()` / `pcov\collect_path_coverage`) and a
+  native `PcovBranchDriver` (no Xdebug impersonation, reusing the existing
+  `pcov_branch.c` producer), a leaner native collection API proposal, the
+  infrastructure adoption requirements, and a phased migration plan (ship compat
+  shim now -> land Selector probe upstream -> deprecate shim). The line-mode
+  invariant is kept explicit throughout. Cross-linked both new docs from
+  `README.md` and `docs/04-distribution.md`.
+
+### Distribution
+- **GitLab CI pipeline.** Added `.gitlab-ci.yml` mirroring the GitHub flow on
+  the official `php:8.2`/`8.3`/`8.4` images: `build` -> `test` (both line and
+  branch mode) -> `package` (`pecl package-validate`/`pecl package`) ->
+  tag-gated `release` (`rules: if $CI_COMMIT_TAG`) that publishes a GitLab
+  Release via `release-cli`.
+- **Prebuilt-binary release assets.** On tag pushes, CI now attaches a
+  per-PHP-version `modules/pcov.so` named to encode version + PHP version + OS +
+  arch + libc/ABI + thread-safety
+  (e.g. `pcov-pcov-enhanced-1.1.0-php8.3-linux-x86_64-gnu-nts.so`)
+  plus a `SHA256SUMS.txt`, so consumers (e.g. `setup-php`) can install without a
+  toolchain. GitHub: new `prebuilt-binaries` + `checksums` jobs in
+  `.github/workflows/ci.yml` (reusing the SHA-pinned `softprops/action-gh-release`,
+  `contents: write` scoped to release/packaging jobs only). Documented the full
+  release-automation flow, the manual PECL/Packagist publish commands, and a
+  copy-pasteable `setup-php` consumption recipe in `docs/04-distribution.md`.
+- **PIE support documented.** Added a PIE (PHP Installer for Extensions,
+  `php/pie`) install route (`pie install juslintek/pcov-enhanced`) to
+  `docs/04-distribution.md` and `INSTALL.md`. PIE reuses the existing
+  `composer.json` `php-ext` metadata and builds from source; `config.m4` is at
+  the repo root so no `php-ext.build-path` override is needed.
+- **package.xml date handling.** Set `<date>` to the current UTC date and
+  documented that it must be bumped per release (removes the PECL "Release Date
+  is not today" validator warning at package time). Added an XML comment noting
+  the "providesextension name differs from package name" warning is intentional
+  (we publish as `pcov_enhanced` while providing the drop-in `pcov` extension).
+- **Repo-rename clarified.** Documented that the GitHub repository stays named
+  `pcov-enhanced` and that package identity does not depend on the repo name
+  (it comes from `package.xml` / `composer.json`); a manual rename by a
+  maintainer is optional.
+- Added a `support.docs` link to `composer.json`.
+- **Addressed automated review (Amazon Q + CodeRabbit) on the distribution
+  infrastructure.** k8s init-container example now mounts the shared `pcov-ext`
+  volume at the stable parent `extension_dir`
+  (`/usr/local/lib/php/extensions`) with the initContainers copying into an
+  api-versioned subdir, so it survives PHP API-version changes, and its seed
+  step no longer masks real copy failures. Added
+  `nodeSelector: { kubernetes.io/arch: amd64 }` to all three k8s pod specs
+  (the referenced images are amd64-only). The prebuilt-image example now applies
+  `PCOV_MODE` at runtime via `php -d "pcov.mode=..."` (the image ships it
+  commented out). GitLab CI now stores each build's `pcov.so` under a
+  per-version path so tests can never load a cross-version binary, guards the
+  release tag against `package.xml` via an early `verify:version` job, and keeps
+  release-linked artifacts (`prebuilt`/`package`/`checksums`) non-expiring
+  (`expire_in: never`). GitHub Actions mirrors the tag↔`package.xml` guard in
+  its `package` and `prebuilt-binaries` jobs. Prebuilt `.so` asset names now
+  encode the glibc ABI baseline as a `-gnu` token
+  (`...-linux-<arch>-gnu-<ts>.so`), identical across GitHub and GitLab, and the
+  docs document the glibc-vs-musl/Alpine limitation plus the init-container
+  libc/ABI matching requirement.
+
 ## [1.1.0] - 2026-09-10
 
 ### Added

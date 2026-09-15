@@ -1,0 +1,42 @@
+# compose.yaml — dev example: build a pcov-enhanced image and run coverage
+# against a mounted project.
+#
+#   docker compose -f docker/compose.yaml build
+#   docker compose -f docker/compose.yaml run --rm pcov php -m | grep pcov
+#   docker compose -f docker/compose.yaml run --rm pcov \
+#       php -d pcov.mode=branch vendor/bin/phpunit --path-coverage
+#
+# Point PROJECT_DIR at the PHP project you want to measure. It is mounted at
+# /app inside the container, which is the working directory.
+#
+# NOTE: `build` pulls the official php:* base image (network required).
+
+services:
+  pcov:
+    build:
+      # Build context is the repository root so config.m4 and the sources are
+      # available; the Dockerfile lives under docker/.
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: final
+      args:
+        # Match this to the PHP version your project targets.
+        PHP_VERSION: "8.4"
+    image: pcov-enhanced:8.4
+    working_dir: /app
+    volumes:
+      # Mount the project under test. Override with:
+      #   PROJECT_DIR=/path/to/project docker compose -f docker/compose.yaml run --rm pcov ...
+      - "${PROJECT_DIR:-./..}:/app"
+    environment:
+      # Opt in to branch + path coverage. Set to "line" (or unset) for the
+      # default, byte-for-byte upstream pcov line coverage.
+      PCOV_MODE: "branch"
+    # Enable pcov branch mode via the env var above without editing php.ini.
+    command:
+      - php
+      - -d
+      - pcov.enabled=1
+      - -d
+      - pcov.mode=branch
+      - -m
