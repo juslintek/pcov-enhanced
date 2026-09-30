@@ -7,6 +7,15 @@
 http://pear.php.net/dtd/tasks-1.0.xsd
 http://pear.php.net/dtd/package-2.0
 http://pear.php.net/dtd/package-2.0.xsd">
+ <!--
+   INTENTIONAL: the package name (pcov_enhanced) differs from the extension it
+   provides (<providesextension>pcov</providesextension> below). This is by
+   design: we publish under a distinct product identity while shipping the
+   drop-in `pcov` extension, so `pecl package-validate` emits a
+   "providesextension name differs from package name" warning. That warning is
+   EXPECTED and correct — do NOT rename the package or the providesextension to
+   silence it, or the build would stop being a drop-in pcov replacement.
+ -->
  <name>pcov_enhanced</name>
  <channel>pecl.php.net</channel>
  <summary>An alternative pcov build adding branch and path coverage (like Xdebug, far faster).</summary>
@@ -34,7 +43,14 @@ This is an unofficial, community distribution based on krakjoe/pcov.
   <email>jusys.linas@gmail.com</email>
   <active>yes</active>
  </lead>
- <date>2026-09-11</date>
+ <!--
+   RELEASE DATE: PECL requires a literal date in the manifest and warns if it is
+   not "today" at package time. Bump this to the current UTC date (YYYY-MM-DD,
+   `date -u +%F`) on every release / when regenerating the tarball, or have the
+   release workflow set it. Stale dates only trigger a validator warning, not an
+   error, but keep it current to publish cleanly.
+ -->
+ <date>2026-09-12</date>
  <version>
   <release>1.1.0</release>
   <api>1.1.0</api>
@@ -63,6 +79,8 @@ Adds opt-in branch and path coverage via pcov.mode=branch:
     <file role="doc" name="02-integration-decision.md"/>
     <file role="doc" name="03-results.md"/>
     <file role="doc" name="04-distribution.md"/>
+    <file role="doc" name="05-tooling-compatibility.md"/>
+    <file role="doc" name="06-future-native-api.md"/>
    </dir>
    <file role="src" name="config.m4"/>
    <file role="src" name="config.w32"/>

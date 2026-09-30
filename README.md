@@ -29,6 +29,23 @@ installation, and [docs/04-distribution.md](docs/04-distribution.md) for the
 full distribution/registry guide. This build installs as the `pcov` extension
 and replaces upstream pcov (only one may be installed at a time).
 
+## Documentation
+
+- [docs/01-contract.md](docs/01-contract.md) — the php-code-coverage driver
+  contract and `Selector` logic (verified against source).
+- [docs/02-integration-decision.md](docs/02-integration-decision.md) — the
+  integration-route decision (why the opt-in Xdebug-compat surface).
+- [docs/03-results.md](docs/03-results.md) — validated performance and
+  semantic-equivalence results.
+- [docs/04-distribution.md](docs/04-distribution.md) — distribution/registry
+  guide (source, PECL/PIE, Composer, prebuilt binaries, Docker, Kubernetes).
+- [docs/05-tooling-compatibility.md](docs/05-tooling-compatibility.md) —
+  compatibility matrix for coverage-consuming tools (PHPUnit/php-code-coverage,
+  Infection, Paratest, Codeception, Behat, Coveralls/Codecov/Scrutinizer).
+- [docs/06-future-native-api.md](docs/06-future-native-api.md) — forward-looking
+  design for a native pcov branch/path driver (route (a)) and a leaner
+  collection API, with a phased migration plan.
+
 
 API
 ===

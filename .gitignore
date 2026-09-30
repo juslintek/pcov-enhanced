@@ -2,6 +2,9 @@
 *.o
 *.lo
 
+# Build dependency files (phpize-generated)
+*.dep
+
 # Libraries
 *.lib
 *.a

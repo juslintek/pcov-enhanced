@@ -42,6 +42,20 @@ because both provide the same `pcov` extension.
 
     composer require --dev juslintek/pcov-enhanced
 
+**Via PIE (PHP Installer for Extensions, PHP 8.3+)**
+
+    pie install juslintek/pcov-enhanced
+
+PIE reuses the same `composer.json` `php-ext` metadata and builds from source,
+installing it as the `pcov` extension. It downloads from Packagist/GitHub, so it
+needs network access and a build toolchain (not runnable fully offline).
+
+> **Repository name:** the GitHub repository stays named `pcov-enhanced`.
+> Package identity comes from `package.xml` (`pcov_enhanced`) and
+> `composer.json` (`juslintek/pcov-enhanced`), not from the repo name, so none
+> of the install routes depend on it. A maintainer may optionally rename the
+> repo manually in GitHub settings; the release automation token cannot.
+
 Configuration
 =============
 
